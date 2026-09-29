@@ -1,35 +1,4 @@
-# name: Spring Boot AWS Deployment
-
-# on:
-#   push:
-#     branches:
-#       - master
-
-# permissions:
-#   id-token: write
-#   contents: read
-
-# jobs:
-#   build:
-#     name: Build Spring Boot Application
-#     runs-on: ubuntu-latest
-
-#     steps:
-#       - name: Checkout source code
-#         uses: actions/checkout@v4
-
-#       - name: Set up Java
-#         uses: actions/setup-java@v4
-#         with:
-#           distribution: temurin
-#           java-version: '8'
-#           cache: maven
-
-#       - name: Build application
-#         working-directory: rest-api
-#         run: ./mvnw clean package -DskipTests
-
-name: Spring Boot Deployment
+name: Test GitHub Actions AWS OIDC
 
 on:
   push:
@@ -41,18 +10,16 @@ permissions:
   contents: read
 
 jobs:
-  deploy:
+  test-oidc:
     runs-on: ubuntu-latest
 
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Configure AWS credentials
-        uses: aws-actions/configure-aws-credentials@v4
-        with:
-          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
-          aws-region: ap-south-1
-
-      - name: Test AWS connection
-        run: aws sts get-caller-identity
+      - name: Show GitHub OIDC information
+        run: |
+          echo "Repository: $GITHUB_REPOSITORY"
+          echo "Repository ID: $GITHUB_REPOSITORY_ID"
+          echo "Repository Owner ID: $GITHUB_REPOSITORY_OWNER_ID"
+          echo "Ref: $GITHUB_REF"
