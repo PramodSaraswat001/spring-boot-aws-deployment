@@ -18,8 +18,10 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Show GitHub OIDC information
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           echo "Repository: $GITHUB_REPOSITORY"
-          echo "Repository ID: $GITHUB_REPOSITORY_ID"
-          echo "Repository Owner ID: $GITHUB_REPOSITORY_OWNER_ID"
+          echo "Repository ID: $(gh api repos/$GITHUB_REPOSITORY --jq '.id')"
+          echo "Repository Owner ID: $(gh api users/$GITHUB_REPOSITORY_OWNER --jq '.id')"
           echo "Ref: $GITHUB_REF"
