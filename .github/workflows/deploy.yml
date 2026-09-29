@@ -27,6 +27,20 @@ jobs:
         run: |
           aws sts get-caller-identity
 
-      - name: Test SSM access
+      - name: Test SSM command
         run: |
-          aws ssm describe-instance-information
+          COMMAND_ID=$(aws ssm send-command \
+            --instance-ids i-02e987472d8f85da2 \
+            --document-name "AWS-RunShellScript" \
+            --parameters 'commands=["echo GitHub Actions SSM test successful","hostname","systemctl is-active springboot"]' \
+            --comment "GitHub Actions SSM test" \
+            --query "Command.CommandId" \
+            --output text)
+
+          echo "Command ID: $COMMAND_ID"
+
+          sleep 5
+
+          aws ssm get-command-invocation \
+            --command-id "$COMMAND_ID" \
+            --instance-id i-02e987472d8f85da2
