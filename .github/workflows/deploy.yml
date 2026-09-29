@@ -1,4 +1,4 @@
-name: Test GitHub Actions AWS OIDC
+name: Test GitHub Actions AWS Access
 
 on:
   push:
@@ -10,18 +10,18 @@ permissions:
   contents: read
 
 jobs:
-  test-oidc:
+  test-aws:
     runs-on: ubuntu-latest
 
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Show GitHub OIDC information
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          echo "Repository: $GITHUB_REPOSITORY"
-          echo "Repository ID: $(gh api repos/$GITHUB_REPOSITORY --jq '.id')"
-          echo "Repository Owner ID: $(gh api users/$GITHUB_REPOSITORY_OWNER --jq '.id')"
-          echo "Ref: $GITHUB_REF"
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: ap-south-1
+
+      - name: Test AWS connection
+        run: aws sts get-caller-identity
