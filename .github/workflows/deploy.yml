@@ -1,4 +1,4 @@
-name: Spring Boot AWS Deployment
+name: Test Spring Boot SSM Deployment
 
 on:
   push:
@@ -10,16 +10,16 @@ permissions:
   contents: read
 
 jobs:
-  deploy:
-    name: Deploy Spring Boot Application
+  test-aws:
+    name: Test AWS and SSM
     runs-on: ubuntu-latest
 
     steps:
-      # 1. Checkout source code
+      # 1. Checkout repository
       - name: Checkout code
         uses: actions/checkout@v4
 
-      # 2. Configure AWS credentials using OIDC
+      # 2. Configure AWS using OIDC
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
         with:
@@ -29,37 +29,61 @@ jobs:
       # 3. Verify AWS authentication
       - name: Test AWS connection
         run: |
+          echo "Testing AWS connection..."
           aws sts get-caller-identity
 
-      # 4. Deploy application to EC2 through AWS Systems Manager
-      - name: Deploy Spring Boot application
+      # 4. Test SSM access and EC2 environment
+      - name: Test SSM access and EC2 environment
+        shell: bash
         run: |
 
+          echo "Sending SSM command to App EC2..."
+
           COMMAND_ID=$(aws ssm send-command \
-            --instance-ids "i-02e987472d8f85da2" \
+            --instance-ids i-02e987472d8f85da2 \
             --document-name "AWS-RunShellScript" \
             --parameters 'commands=[
-              "cd /home/ssm-user/spring-boot-docker-rest-api/rest-api",
-              "git fetch origin",
-              "git reset --hard origin/master",
-              "./mvnw clean package -DskipTests",
-              "sudo systemctl restart springboot",
-              "sleep 10",
-              "sudo systemctl is-active springboot",
-              "curl -f http://localhost:9090/api/v1/categories/"
+              "echo START_DEPLOYMENT_TEST",
+              "echo USER:",
+              "whoami",
+              "echo CURRENT_DIRECTORY:",
+              "pwd",
+              "echo JAVA_VERSION:",
+              "java -version",
+              "echo PROJECT_DIRECTORY:",
+              "ls -la /home/ssm-user/spring-boot-docker-rest-api/rest-api/",
+              "echo TARGET_DIRECTORY:",
+              "ls -la /home/ssm-user/spring-boot-docker-rest-api/rest-api/target/",
+              "echo JAR_FILE:",
+              "ls -lh /home/ssm-user/spring-boot-docker-rest-api/rest-api/target/spring-boot-rest-api-v1.jar",
+              "echo SPRINGBOOT_SERVICE:",
+              "sudo systemctl status springboot --no-pager",
+              "echo WORKING_DIRECTORY:",
+              "sudo systemctl show springboot --property=WorkingDirectory",
+              "echo SERVICE_FILE:",
+              "sudo systemctl cat springboot",
+              "echo END_DEPLOYMENT_TEST"
             ]' \
-            --comment "GitHub Actions Spring Boot deployment" \
+            --region ap-south-1 \
             --query "Command.CommandId" \
             --output text)
 
           echo "SSM Command ID: $COMMAND_ID"
 
-          # Wait for SSM command to complete
+          echo "Waiting for SSM command to complete..."
+
           aws ssm wait command-executed \
             --command-id "$COMMAND_ID" \
-            --instance-id "i-02e987472d8f85da2"
+            --instance-id i-02e987472d8f85da2 \
+            --region ap-south-1
 
-          # Get command result
+          echo "Getting SSM command result..."
+
           aws ssm get-command-invocation \
             --command-id "$COMMAND_ID" \
-            --instance-id "i-02e987472d8f85da2"
+            --instance-id i-02e987472d8f85da2 \
+            --region ap-south-1 \
+            --query "{Status:Status,StatusDetails:StatusDetails,Output:StandardOutputContent,Error:StandardErrorContent}" \
+            --output json
+
+          echo "SSM diagnostic test completed."
