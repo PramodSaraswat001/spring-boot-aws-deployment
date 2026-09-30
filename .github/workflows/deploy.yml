@@ -1,14 +1,17 @@
 name: Spring Boot Rolling Deployment
 
+# Run deployment whenever code is pushed to master
 on:
   push:
     branches:
       - master
 
+# Allow GitHub Actions to authenticate with AWS using OIDC
 permissions:
   id-token: write
   contents: read
 
+# Common deployment configuration
 env:
   AWS_REGION: ap-south-1
   ASG_NAME: springboot-app-asg
@@ -22,28 +25,27 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      # 1. Checkout source code
+      # 1. Download repository code
       - name: Checkout code
         uses: actions/checkout@v4
 
-      # 2. Configure AWS using OIDC
+      # 2. Authenticate GitHub Actions with AWS
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: ${{ vars.AWS_ROLE_ARN }}
           aws-region: ${{ env.AWS_REGION }}
 
-      # 3. Verify AWS access
+      # 3. Confirm AWS authentication
       - name: Verify AWS identity
         run: |
           aws sts get-caller-identity
 
-      # 4. Get InService EC2 instances from ASG
-      - name: Get ASG instances
+      # 4. Get all healthy InService instances from ASG
+      - name: Get InService ASG instances
         id: instances
         shell: bash
         run: |
-
           echo "Getting instances from ASG: $ASG_NAME"
 
           INSTANCE_IDS=$(aws autoscaling describe-auto-scaling-groups \
@@ -62,11 +64,10 @@ jobs:
 
           echo "instance_ids=$INSTANCE_IDS" >> "$GITHUB_OUTPUT"
 
-      # 5. Deploy one instance at a time
+      # 5. Deploy to each EC2 instance one at a time
       - name: Rolling deployment
         shell: bash
         run: |
-
           set -e
 
           INSTANCE_IDS="${{ steps.instances.outputs.instance_ids }}"
@@ -76,13 +77,12 @@ jobs:
 
           for INSTANCE_ID in $INSTANCE_IDS
           do
-
             echo ""
             echo "=========================================="
             echo "Deploying instance: $INSTANCE_ID"
             echo "=========================================="
 
-            # Send deployment commands through SSM
+            # 6. Send deployment commands to EC2 through SSM
             COMMAND_ID=$(aws ssm send-command \
               --instance-ids "$INSTANCE_ID" \
               --document-name "AWS-RunShellScript" \
@@ -92,6 +92,7 @@ jobs:
                 "echo START_DEPLOYMENT",
                 "echo INSTANCE: $(hostname)",
                 "cd /home/ssm-user/spring-boot-docker-rest-api/rest-api",
+                "git config --global --add safe.directory /home/ssm-user/spring-boot-docker-rest-api/rest-api",
                 "echo CURRENT_COMMIT:",
                 "git rev-parse --short HEAD",
                 "echo FETCHING_LATEST_CODE",
@@ -119,12 +120,13 @@ jobs:
 
             echo "SSM Command ID: $COMMAND_ID"
 
-            # Wait for SSM command to finish
+            # 7. Wait until SSM deployment finishes
             echo "Waiting for SSM deployment..."
+
+            SUCCESS=false
 
             for i in {1..90}
             do
-
               STATUS=$(aws ssm get-command-invocation \
                 --command-id "$COMMAND_ID" \
                 --instance-id "$INSTANCE_ID" \
@@ -135,9 +137,11 @@ jobs:
               echo "Attempt $i - Status: $STATUS"
 
               if [ "$STATUS" = "Success" ]; then
+                SUCCESS=true
                 break
               fi
 
+              # Stop if SSM reports a deployment failure
               if [ "$STATUS" = "Failed" ] || \
                  [ "$STATUS" = "Cancelled" ] || \
                  [ "$STATUS" = "TimedOut" ]; then
@@ -155,10 +159,15 @@ jobs:
               fi
 
               sleep 10
-
             done
 
-            # Display deployment output
+            # 8. Fail if SSM did not finish within the timeout
+            if [ "$SUCCESS" != "true" ]; then
+              echo "ERROR: SSM command timed out."
+              exit 1
+            fi
+
+            # 9. Show deployment logs
             echo ""
             echo "Deployment output:"
 
@@ -169,13 +178,19 @@ jobs:
               --query "{Status:Status,Output:StandardOutputContent,Error:StandardErrorContent}" \
               --output json
 
-            # Get Target Group ARN
+            # 10. Get ALB target group ARN
             TARGET_GROUP_ARN=$(aws elbv2 describe-target-groups \
               --names "$TARGET_GROUP_NAME" \
               --region "$AWS_REGION" \
               --query "TargetGroups[0].TargetGroupArn" \
               --output text)
 
+            if [ -z "$TARGET_GROUP_ARN" ] || [ "$TARGET_GROUP_ARN" = "None" ]; then
+              echo "ERROR: Target group not found."
+              exit 1
+            fi
+
+            # 11. Wait until the updated instance is healthy in ALB
             echo ""
             echo "Waiting for ALB target to become healthy..."
 
@@ -183,7 +198,6 @@ jobs:
 
             for i in {1..30}
             do
-
               HEALTH=$(aws elbv2 describe-target-health \
                 --target-group-arn "$TARGET_GROUP_ARN" \
                 --targets Id="$INSTANCE_ID" \
@@ -199,24 +213,27 @@ jobs:
               fi
 
               sleep 10
-
             done
 
+            # 12. Stop deployment if ALB health check fails
             if [ "$HEALTHY" != "true" ]; then
               echo "ERROR: Instance $INSTANCE_ID did not become healthy."
               exit 1
             fi
 
+            # 13. Instance deployment completed successfully
             echo ""
             echo "=========================================="
             echo "Instance $INSTANCE_ID deployment SUCCESS"
             echo "ALB health: healthy"
             echo "=========================================="
 
+            # Give the instance a short stabilization period
             sleep 5
 
           done
 
+          # 14. All instances completed successfully
           echo ""
           echo "=========================================="
           echo "ROLLING DEPLOYMENT COMPLETED"
