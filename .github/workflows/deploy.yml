@@ -1,4 +1,4 @@
-name: Test Spring Boot SSM Deployment
+name: Spring Boot Rolling Deployment
 
 on:
   push:
@@ -9,13 +9,20 @@ permissions:
   id-token: write
   contents: read
 
+env:
+  AWS_REGION: ap-south-1
+  ASG_NAME: springboot-app-asg
+  TARGET_GROUP_NAME: springboot-tg
+  APP_DIR: /home/ssm-user/spring-boot-docker-rest-api/rest-api
+  SERVICE_NAME: springboot
+
 jobs:
-  test-aws:
-    name: Test AWS and SSM
+  deploy:
+    name: Rolling Deployment
     runs-on: ubuntu-latest
 
     steps:
-      # 1. Checkout repository
+      # 1. Checkout source code
       - name: Checkout code
         uses: actions/checkout@v4
 
@@ -24,66 +31,193 @@ jobs:
         uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: ${{ vars.AWS_ROLE_ARN }}
-          aws-region: ap-south-1
+          aws-region: ${{ env.AWS_REGION }}
 
-      # 3. Verify AWS authentication
-      - name: Test AWS connection
+      # 3. Verify AWS access
+      - name: Verify AWS identity
         run: |
-          echo "Testing AWS connection..."
           aws sts get-caller-identity
 
-      # 4. Test SSM access and EC2 environment
-      - name: Test SSM access and EC2 environment
+      # 4. Get InService EC2 instances from ASG
+      - name: Get ASG instances
+        id: instances
         shell: bash
         run: |
 
-          echo "Sending SSM command to App EC2..."
+          echo "Getting instances from ASG: $ASG_NAME"
 
-          COMMAND_ID=$(aws ssm send-command \
-            --instance-ids i-02e987472d8f85da2 \
-            --document-name "AWS-RunShellScript" \
-            --parameters 'commands=[
-              "echo START_DEPLOYMENT_TEST",
-              "echo USER:",
-              "whoami",
-              "echo CURRENT_DIRECTORY:",
-              "pwd",
-              "echo JAVA_VERSION:",
-              "java -version",
-              "echo PROJECT_DIRECTORY:",
-              "ls -la /home/ssm-user/spring-boot-docker-rest-api/rest-api/",
-              "echo TARGET_DIRECTORY:",
-              "ls -la /home/ssm-user/spring-boot-docker-rest-api/rest-api/target/",
-              "echo JAR_FILE:",
-              "ls -lh /home/ssm-user/spring-boot-docker-rest-api/rest-api/target/spring-boot-rest-api-v1.jar",
-              "echo SPRINGBOOT_SERVICE:",
-              "sudo systemctl status springboot --no-pager",
-              "echo WORKING_DIRECTORY:",
-              "sudo systemctl show springboot --property=WorkingDirectory",
-              "echo SERVICE_FILE:",
-              "sudo systemctl cat springboot",
-              "echo END_DEPLOYMENT_TEST"
-            ]' \
-            --region ap-south-1 \
-            --query "Command.CommandId" \
+          INSTANCE_IDS=$(aws autoscaling describe-auto-scaling-groups \
+            --auto-scaling-group-names "$ASG_NAME" \
+            --region "$AWS_REGION" \
+            --query "AutoScalingGroups[0].Instances[?LifecycleState=='InService'].InstanceId" \
             --output text)
 
-          echo "SSM Command ID: $COMMAND_ID"
+          if [ -z "$INSTANCE_IDS" ]; then
+            echo "ERROR: No InService instances found."
+            exit 1
+          fi
 
-          echo "Waiting for SSM command to complete..."
+          echo "Found instances:"
+          echo "$INSTANCE_IDS"
 
-          aws ssm wait command-executed \
-            --command-id "$COMMAND_ID" \
-            --instance-id i-02e987472d8f85da2 \
-            --region ap-south-1
+          echo "instance_ids=$INSTANCE_IDS" >> "$GITHUB_OUTPUT"
 
-          echo "Getting SSM command result..."
+      # 5. Deploy one instance at a time
+      - name: Rolling deployment
+        shell: bash
+        run: |
 
-          aws ssm get-command-invocation \
-            --command-id "$COMMAND_ID" \
-            --instance-id i-02e987472d8f85da2 \
-            --region ap-south-1 \
-            --query "{Status:Status,StatusDetails:StatusDetails,Output:StandardOutputContent,Error:StandardErrorContent}" \
-            --output json
+          set -e
 
-          echo "SSM diagnostic test completed."
+          INSTANCE_IDS="${{ steps.instances.outputs.instance_ids }}"
+
+          echo "Starting rolling deployment..."
+          echo "Instances: $INSTANCE_IDS"
+
+          for INSTANCE_ID in $INSTANCE_IDS
+          do
+
+            echo ""
+            echo "=========================================="
+            echo "Deploying instance: $INSTANCE_ID"
+            echo "=========================================="
+
+            # Send deployment commands through SSM
+            COMMAND_ID=$(aws ssm send-command \
+              --instance-ids "$INSTANCE_ID" \
+              --document-name "AWS-RunShellScript" \
+              --timeout-seconds 900 \
+              --parameters 'commands=[
+                "set -e",
+                "echo START_DEPLOYMENT",
+                "echo INSTANCE: $(hostname)",
+                "cd /home/ssm-user/spring-boot-docker-rest-api/rest-api",
+                "echo CURRENT_COMMIT:",
+                "git rev-parse --short HEAD",
+                "echo FETCHING_LATEST_CODE",
+                "git fetch origin master",
+                "git reset --hard origin/master",
+                "echo NEW_COMMIT:",
+                "git rev-parse --short HEAD",
+                "echo BUILDING_APPLICATION",
+                "./mvnw clean package -DskipTests",
+                "echo BUILD_SUCCESS",
+                "ls -lh target/spring-boot-rest-api-v1.jar",
+                "echo RESTARTING_APPLICATION",
+                "sudo systemctl restart springboot",
+                "echo WAITING_FOR_APPLICATION",
+                "sleep 15",
+                "echo SERVICE_STATUS",
+                "sudo systemctl is-active springboot",
+                "echo LOCAL_HEALTH_CHECK",
+                "curl --fail --silent --show-error http://localhost:9090/api/v1/categories/",
+                "echo DEPLOYMENT_SUCCESS"
+              ]' \
+              --region "$AWS_REGION" \
+              --query "Command.CommandId" \
+              --output text)
+
+            echo "SSM Command ID: $COMMAND_ID"
+
+            # Wait for SSM command to finish
+            echo "Waiting for SSM deployment..."
+
+            for i in {1..90}
+            do
+
+              STATUS=$(aws ssm get-command-invocation \
+                --command-id "$COMMAND_ID" \
+                --instance-id "$INSTANCE_ID" \
+                --region "$AWS_REGION" \
+                --query "Status" \
+                --output text 2>/dev/null || echo "Pending")
+
+              echo "Attempt $i - Status: $STATUS"
+
+              if [ "$STATUS" = "Success" ]; then
+                break
+              fi
+
+              if [ "$STATUS" = "Failed" ] || \
+                 [ "$STATUS" = "Cancelled" ] || \
+                 [ "$STATUS" = "TimedOut" ]; then
+
+                echo "Deployment failed on $INSTANCE_ID"
+
+                aws ssm get-command-invocation \
+                  --command-id "$COMMAND_ID" \
+                  --instance-id "$INSTANCE_ID" \
+                  --region "$AWS_REGION" \
+                  --query "{Status:Status,StatusDetails:StatusDetails,Output:StandardOutputContent,Error:StandardErrorContent}" \
+                  --output json
+
+                exit 1
+              fi
+
+              sleep 10
+
+            done
+
+            # Display deployment output
+            echo ""
+            echo "Deployment output:"
+
+            aws ssm get-command-invocation \
+              --command-id "$COMMAND_ID" \
+              --instance-id "$INSTANCE_ID" \
+              --region "$AWS_REGION" \
+              --query "{Status:Status,Output:StandardOutputContent,Error:StandardErrorContent}" \
+              --output json
+
+            # Get Target Group ARN
+            TARGET_GROUP_ARN=$(aws elbv2 describe-target-groups \
+              --names "$TARGET_GROUP_NAME" \
+              --region "$AWS_REGION" \
+              --query "TargetGroups[0].TargetGroupArn" \
+              --output text)
+
+            echo ""
+            echo "Waiting for ALB target to become healthy..."
+
+            HEALTHY=false
+
+            for i in {1..30}
+            do
+
+              HEALTH=$(aws elbv2 describe-target-health \
+                --target-group-arn "$TARGET_GROUP_ARN" \
+                --targets Id="$INSTANCE_ID" \
+                --region "$AWS_REGION" \
+                --query "TargetHealthDescriptions[0].TargetHealth.State" \
+                --output text 2>/dev/null || echo "unknown")
+
+              echo "ALB health attempt $i: $HEALTH"
+
+              if [ "$HEALTH" = "healthy" ]; then
+                HEALTHY=true
+                break
+              fi
+
+              sleep 10
+
+            done
+
+            if [ "$HEALTHY" != "true" ]; then
+              echo "ERROR: Instance $INSTANCE_ID did not become healthy."
+              exit 1
+            fi
+
+            echo ""
+            echo "=========================================="
+            echo "Instance $INSTANCE_ID deployment SUCCESS"
+            echo "ALB health: healthy"
+            echo "=========================================="
+
+            sleep 5
+
+          done
+
+          echo ""
+          echo "=========================================="
+          echo "ROLLING DEPLOYMENT COMPLETED"
+          echo "=========================================="
