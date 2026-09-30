@@ -89,10 +89,11 @@ jobs:
               --timeout-seconds 900 \
               --parameters 'commands=[
                 "set -e",
+                "export HOME=/home/ssm-user",
                 "echo START_DEPLOYMENT",
                 "echo INSTANCE: $(hostname)",
                 "cd /home/ssm-user/spring-boot-docker-rest-api/rest-api",
-                "git config --global --add safe.directory /home/ssm-user/spring-boot-docker-rest-api/rest-api",
+                "git config --global --add safe.directory /home/ssm-user/spring-boot-docker-rest-api",
                 "echo CURRENT_COMMIT:",
                 "git rev-parse --short HEAD",
                 "echo FETCHING_LATEST_CODE",
