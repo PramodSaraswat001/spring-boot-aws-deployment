@@ -51,7 +51,7 @@ jobs:
           INSTANCE_IDS=$(aws autoscaling describe-auto-scaling-groups \
             --auto-scaling-group-names "$ASG_NAME" \
             --region "$AWS_REGION" \
-            --query "AutoScalingGroups[0].Instances[?LifecycleState=='InService'].InstanceId" \
+            --query "AutoScalingGroups[0].Instances[?LifecycleState=='InService' && HealthStatus=='Healthy'].InstanceId" \
             --output text)
 
           if [ -z "$INSTANCE_IDS" ]; then
