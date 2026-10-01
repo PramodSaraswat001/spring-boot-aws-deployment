@@ -1,17 +1,16 @@
 name: Spring Boot Rolling Deployment
 
-# Run deployment whenever code is pushed to master
+# Trigger deployment on push to master branch
 on:
   push:
     branches:
       - master
 
-# Allow GitHub Actions to authenticate with AWS using OIDC
+# Request OIDC token for AWS authentication
 permissions:
   id-token: write
   contents: read
 
-# Common deployment configuration
 env:
   AWS_REGION: ap-south-1
   ASG_NAME: springboot-app-asg
@@ -26,13 +25,13 @@ jobs:
 
     steps:
       # ==========================================================
-      # 1. Checkout repository
+      # 1. Checkout repository code
       # ==========================================================
-      - name: Checkout code
+      - name: Checkout repository
         uses: actions/checkout@v4
 
       # ==========================================================
-      # 2. Configure AWS credentials using OIDC
+      # 2. Authenticate to AWS via OIDC Role
       # ==========================================================
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
@@ -41,21 +40,14 @@ jobs:
           aws-region: ${{ env.AWS_REGION }}
 
       # ==========================================================
-      # 3. Verify AWS identity
+      # 3. Verify AWS Identity
       # ==========================================================
-      - name: Verify AWS identity
-        shell: bash
+      - name: Verify AWS Identity
         run: |
-          set -e
-
-          echo "=========================================="
-          echo "AWS Identity"
-          echo "=========================================="
-
           aws sts get-caller-identity
 
       # ==========================================================
-      # 4. Get all healthy InService instances from ASG
+      # 4. Get active InService instances from ASG
       # ==========================================================
       - name: Get InService ASG instances
         id: instances
@@ -63,115 +55,85 @@ jobs:
         run: |
           set -euo pipefail
 
-          echo "=========================================="
-          echo "Getting InService ASG instances"
-          echo "=========================================="
-
-          echo "ASG: $ASG_NAME"
-
+          echo "Querying instances from ASG: $ASG_NAME in $AWS_REGION..."
           INSTANCE_IDS=$(aws autoscaling describe-auto-scaling-groups \
             --auto-scaling-group-names "$ASG_NAME" \
             --region "$AWS_REGION" \
-            --query "AutoScalingGroups[0].Instances[?LifecycleState=='InService' && HealthStatus=='Healthy'].InstanceId" \
+            --query "AutoScalingGroups[0].Instances[?LifecycleState=='InService'].InstanceId" \
             --output text)
 
           if [ -z "$INSTANCE_IDS" ] || [ "$INSTANCE_IDS" = "None" ]; then
-            echo "ERROR: No InService and Healthy instances found."
+            echo "ERROR: No InService instances found in Auto Scaling Group: $ASG_NAME"
             exit 1
           fi
 
-          echo "Found instances:"
-          echo "$INSTANCE_IDS"
-
-          INSTANCE_COUNT=$(echo "$INSTANCE_IDS" | wc -w)
-
-          echo "Healthy InService instance count: $INSTANCE_COUNT"
-
-          # Rolling deployment requires at least 2 instances
-          # so that one instance can continue serving traffic
-          # while the other instance is being restarted.
-          if [ "$INSTANCE_COUNT" -lt 2 ]; then
-            echo "ERROR: Rolling deployment requires at least 2 healthy InService instances."
-            echo "Current healthy instance count: $INSTANCE_COUNT"
-            exit 1
-          fi
-
+          echo "Target Instances: $INSTANCE_IDS"
           echo "instance_ids=$INSTANCE_IDS" >> "$GITHUB_OUTPUT"
 
       # ==========================================================
-      # 5. Rolling deployment
+      # 5. Execute Rolling Deployment via AWS Systems Manager (SSM)
       # ==========================================================
-      - name: Rolling deployment
+      - name: Deploy to EC2 instances
         shell: bash
         run: |
           set -euo pipefail
-
           INSTANCE_IDS="${{ steps.instances.outputs.instance_ids }}"
 
-          echo "=========================================="
-          echo "Starting rolling deployment"
-          echo "=========================================="
-          echo "Instances:"
-          echo "$INSTANCE_IDS"
+          # Fetch Target Group ARN for ALB Health Checks
+          echo "Fetching Target Group ARN for $TARGET_GROUP_NAME..."
+          TARGET_GROUP_ARN=$(aws elbv2 describe-target-groups \
+            --names "$TARGET_GROUP_NAME" \
+            --region "$AWS_REGION" \
+            --query "TargetGroups[0].TargetGroupArn" \
+            --output text)
 
+          if [ -z "$TARGET_GROUP_ARN" ] || [ "$TARGET_GROUP_ARN" = "None" ]; then
+            echo "ERROR: Target group '$TARGET_GROUP_NAME' not found."
+            exit 1
+          fi
+          echo "Target Group ARN: $TARGET_GROUP_ARN"
+
+          # Deploy to each instance sequentially
           for INSTANCE_ID in $INSTANCE_IDS
           do
-
             echo ""
-            echo "=========================================="
-            echo "Deploying instance: $INSTANCE_ID"
-            echo "=========================================="
+            echo "=========================================================="
+            echo "Deploying to Instance: $INSTANCE_ID"
+            echo "=========================================================="
 
-            # ====================================================
-            # 6. Send deployment commands through SSM
-            # ====================================================
-
+            # Send deployment commands via SSM
             COMMAND_ID=$(aws ssm send-command \
               --instance-ids "$INSTANCE_ID" \
               --document-name "AWS-RunShellScript" \
               --timeout-seconds 900 \
+              --comment "Deploy Spring Boot Application" \
               --parameters 'commands=[
                 "set -e",
                 "export HOME=/home/ssm-user",
-                "echo START_DEPLOYMENT",
-                "echo INSTANCE: $(hostname)",
+                "echo === PULLING LATEST CODE ===",
                 "cd /home/ssm-user/spring-boot-docker-rest-api/rest-api",
                 "git config --global --add safe.directory /home/ssm-user/spring-boot-docker-rest-api",
-                "echo CURRENT_COMMIT:",
-                "git rev-parse --short HEAD",
-                "echo FETCHING_LATEST_CODE",
                 "git fetch origin master",
                 "git reset --hard origin/master",
-                "echo NEW_COMMIT:",
-                "git rev-parse --short HEAD",
-                "echo BUILDING_APPLICATION",
+                "echo === BUILDING JAR WITH MAVEN ===",
                 "./mvnw clean package -DskipTests",
-                "echo BUILD_SUCCESS",
-                "ls -lh target/spring-boot-rest-api-v1.jar",
-                "echo RESTARTING_APPLICATION",
+                "echo === RESTARTING SPRING BOOT SERVICE ===",
                 "sudo systemctl restart springboot",
-                "echo WAITING_FOR_APPLICATION_TO_BECOME_HEALTHY",
-                "i=1; while [ \"$i\" -le 60 ]; do echo HEALTH_CHECK_ATTEMPT_${i}_OF_60; if ! sudo systemctl is-active --quiet springboot; then echo ERROR_SPRING_BOOT_SERVICE_STOPPED; sudo systemctl status springboot --no-pager; sudo journalctl -u springboot -n 100 --no-pager; exit 1; fi; if curl --fail --silent --show-error --max-time 5 http://localhost:9090/api/v1/categories/ > /dev/null; then echo APPLICATION_IS_HEALTHY; break; fi; echo APPLICATION_NOT_READY_WAITING_5_SECONDS; if [ \"$i\" -eq 60 ]; then echo ERROR_APPLICATION_DID_NOT_BECOME_HEALTHY; sudo systemctl status springboot --no-pager; sudo journalctl -u springboot -n 100 --no-pager; sudo ss -lntp | grep 9090 || true; exit 1; fi; sleep 5; i=$((i + 1)); done",
-                "echo DEPLOYMENT_SUCCESS"
+                "echo === WAITING FOR APPLICATION HEALTH (Port 9090) ===",
+                "for i in $(seq 1 60); do if curl -s -f http://localhost:9090/api/v1/categories/ > /dev/null; then echo APPLICATION_HEALTHY; exit 0; fi; if ! sudo systemctl is-active --quiet springboot; then echo ERROR: Spring Boot service stopped unexpectedly; sudo journalctl -u springboot -n 50 --no-pager; exit 1; fi; echo Attempt $i/60: Application starting, waiting 5s...; sleep 5; done; echo ERROR: Application failed to become healthy within 5 minutes; sudo journalctl -u springboot -n 50 --no-pager; exit 1"
               ]' \
               --region "$AWS_REGION" \
               --query "Command.CommandId" \
               --output text)
 
-            echo "SSM Command ID: $COMMAND_ID"
+            echo "Sent SSM Command ID: $COMMAND_ID"
 
-            # ====================================================
-            # 7. Wait for SSM deployment to complete
-            # ====================================================
-
-            echo ""
-            echo "Waiting for SSM deployment..."
-
+            # --------------------------------------------------------
+            # Poll SSM execution status until completion
+            # --------------------------------------------------------
+            echo "Waiting for build and service restart to complete on $INSTANCE_ID..."
             SUCCESS=false
-
-            for i in {1..90}
-            do
-
+            for i in $(seq 1 90); do
               STATUS=$(aws ssm get-command-invocation \
                 --command-id "$COMMAND_ID" \
                 --instance-id "$INSTANCE_ID" \
@@ -179,125 +141,45 @@ jobs:
                 --query "Status" \
                 --output text 2>/dev/null || echo "Pending")
 
-              echo "Attempt $i/90 - SSM Status: $STATUS"
+              echo "SSM Status ($i/90): $STATUS"
 
-              # -------------------------------
-              # SSM command successful
-              # -------------------------------
               if [ "$STATUS" = "Success" ]; then
                 SUCCESS=true
                 break
-              fi
-
-              # -------------------------------
-              # SSM command failed
-              # -------------------------------
-              if [ "$STATUS" = "Failed" ] || \
-                 [ "$STATUS" = "Cancelled" ] || \
-                 [ "$STATUS" = "TimedOut" ]; then
-
-                echo ""
-                echo "=========================================="
-                echo "DEPLOYMENT FAILED"
-                echo "Instance: $INSTANCE_ID"
-                echo "SSM Status: $STATUS"
-                echo "=========================================="
-
+              elif [ "$STATUS" = "Failed" ] || [ "$STATUS" = "Cancelled" ] || [ "$STATUS" = "TimedOut" ]; then
+                echo "SSM execution failed with status: $STATUS"
                 aws ssm get-command-invocation \
                   --command-id "$COMMAND_ID" \
                   --instance-id "$INSTANCE_ID" \
                   --region "$AWS_REGION" \
-                  --query "{Status:Status,StatusDetails:StatusDetails,Output:StandardOutputContent,Error:StandardErrorContent}" \
+                  --query "{Status:Status,Output:StandardOutputContent,Error:StandardErrorContent}" \
                   --output json
-
                 exit 1
               fi
-
               sleep 10
-
             done
 
-            # ====================================================
-            # 8. Check SSM timeout
-            # ====================================================
-
             if [ "$SUCCESS" != "true" ]; then
-
-              echo ""
-              echo "=========================================="
-              echo "ERROR: SSM command did not finish"
-              echo "within the expected time."
-              echo "=========================================="
-
-              aws ssm get-command-invocation \
-                --command-id "$COMMAND_ID" \
-                --instance-id "$INSTANCE_ID" \
-                --region "$AWS_REGION" \
-                --query "{Status:Status,StatusDetails:StatusDetails,Output:StandardOutputContent,Error:StandardErrorContent}" \
-                --output json || true
-
+              echo "ERROR: SSM command timed out after 15 minutes."
               exit 1
             fi
 
-            # ====================================================
-            # 9. Show deployment output
-            # ====================================================
-
-            echo ""
-            echo "=========================================="
-            echo "Deployment output for $INSTANCE_ID"
-            echo "=========================================="
-
+            # Print deployment logs from EC2
+            echo "--- EC2 Execution Output ---"
             aws ssm get-command-invocation \
               --command-id "$COMMAND_ID" \
               --instance-id "$INSTANCE_ID" \
               --region "$AWS_REGION" \
-              --query "{Status:Status,Output:StandardOutputContent,Error:StandardErrorContent}" \
-              --output json
+              --query "StandardOutputContent" \
+              --output text
 
-            # ====================================================
-            # 10. Get Target Group ARN
-            # ====================================================
-
+            # --------------------------------------------------------
+            # Verify Target Group Health in ALB
+            # --------------------------------------------------------
             echo ""
-            echo "=========================================="
-            echo "Getting target group ARN"
-            echo "=========================================="
-
-            TARGET_GROUP_ARN=$(aws elbv2 describe-target-groups \
-              --names "$TARGET_GROUP_NAME" \
-              --region "$AWS_REGION" \
-              --query "TargetGroups[0].TargetGroupArn" \
-              --output text)
-
-            if [ -z "$TARGET_GROUP_ARN" ] || [ "$TARGET_GROUP_ARN" = "None" ]; then
-              echo "ERROR: Target group not found."
-              exit 1
-            fi
-
-            echo "Target Group ARN:"
-            echo "$TARGET_GROUP_ARN"
-
-            # ====================================================
-            # 11. Wait for ALB target to become healthy
-            # ====================================================
-
-            echo ""
-            echo "=========================================="
-            echo "Waiting for ALB target to become healthy"
-            echo "Instance: $INSTANCE_ID"
-            echo "=========================================="
-
-            HEALTHY=false
-
-            # POSIX-compatible loop.
-            # Do not use {1..30} because this section may execute
-            # in a shell where Bash brace expansion is unavailable.
-            i=1
-
-            while [ "$i" -le 30 ]
-            do
-
+            echo "Verifying Application Load Balancer health for $INSTANCE_ID..."
+            ALB_HEALTHY=false
+            for alb_attempt in $(seq 1 30); do
               HEALTH=$(aws elbv2 describe-target-health \
                 --target-group-arn "$TARGET_GROUP_ARN" \
                 --targets Id="$INSTANCE_ID" \
@@ -305,83 +187,29 @@ jobs:
                 --query "TargetHealthDescriptions[0].TargetHealth.State" \
                 --output text 2>/dev/null || echo "unknown")
 
-              echo "ALB health attempt $i/30: $HEALTH"
-
+              echo "ALB Target State ($alb_attempt/30): $HEALTH"
               if [ "$HEALTH" = "healthy" ]; then
-                HEALTHY=true
+                ALB_HEALTHY=true
                 break
               fi
-
-              if [ "$i" -lt 30 ]; then
-                sleep 10
-              fi
-
-              i=$((i + 1))
-
+              sleep 10
             done
 
-            # ====================================================
-            # 12. Fail if ALB health check fails
-            # ====================================================
-
-            if [ "$HEALTHY" != "true" ]; then
-
-              echo ""
-              echo "=========================================="
-              echo "ERROR: ALB HEALTH CHECK FAILED"
-              echo "Instance: $INSTANCE_ID"
-              echo "=========================================="
-
-              echo ""
-              echo "Final target health:"
-
+            if [ "$ALB_HEALTHY" != "true" ]; then
+              echo "ERROR: Instance $INSTANCE_ID did not pass ALB health check."
               aws elbv2 describe-target-health \
                 --target-group-arn "$TARGET_GROUP_ARN" \
                 --targets Id="$INSTANCE_ID" \
                 --region "$AWS_REGION" \
                 --output json
-
-              echo ""
-              echo "Spring Boot service status:"
-
-              aws ssm send-command \
-                --instance-ids "$INSTANCE_ID" \
-                --document-name "AWS-RunShellScript" \
-                --parameters 'commands=[
-                  "sudo systemctl status springboot --no-pager",
-                  "sudo journalctl -u springboot -n 100 --no-pager",
-                  "sudo ss -lntp | grep 9090 || true"
-                ]' \
-                --region "$AWS_REGION" \
-                --query "Command.CommandId" \
-                --output text || true
-
               exit 1
             fi
 
-            # ====================================================
-            # 13. Instance deployment successful
-            # ====================================================
-
-            echo ""
-            echo "=========================================="
-            echo "INSTANCE DEPLOYMENT SUCCESS"
-            echo "Instance: $INSTANCE_ID"
-            echo "Local application: HEALTHY"
-            echo "ALB health: HEALTHY"
-            echo "=========================================="
-
-            # Give ALB and application a short stabilization period
-            echo "Waiting 5 seconds before next instance..."
+            echo "Instance $INSTANCE_ID is Healthy and receiving traffic."
             sleep 5
-
           done
 
-          # ======================================================
-          # 14. All instances successfully deployed
-          # ======================================================
-
           echo ""
-          echo "=========================================="
-          echo "ROLLING DEPLOYMENT COMPLETED SUCCESSFULLY"
-          echo "=========================================="
+          echo "=========================================================="
+          echo "DEPLOYMENT COMPLETED SUCCESSFULLY ON ALL INSTANCES"
+          echo "=========================================================="
