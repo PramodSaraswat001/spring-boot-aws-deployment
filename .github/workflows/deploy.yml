@@ -1,14 +1,17 @@
 name: Spring Boot Rolling Deployment
 
+# Run deployment whenever code is pushed to master
 on:
   push:
     branches:
       - master
 
+# Allow GitHub Actions to authenticate with AWS using OIDC
 permissions:
   id-token: write
   contents: read
 
+# Common deployment configuration
 env:
   AWS_REGION: ap-south-1
   ASG_NAME: springboot-app-asg
@@ -20,18 +23,34 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
+      # ============================================================
+      # 1. Checkout repository
+      # ============================================================
       - name: Checkout repository
         uses: actions/checkout@v4
 
+      # ============================================================
+      # 2. Configure AWS credentials using GitHub OIDC
+      # ============================================================
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: ${{ vars.AWS_ROLE_ARN }}
           aws-region: ${{ env.AWS_REGION }}
 
+      # ============================================================
+      # 3. Verify AWS identity
+      # ============================================================
       - name: Verify AWS Identity
-        run: aws sts get-caller-identity
+        run: |
+          set -euo pipefail
 
+          echo "AWS Identity:"
+          aws sts get-caller-identity
+
+      # ============================================================
+      # 4. Get InService instances from Auto Scaling Group
+      # ============================================================
       - name: Get InService ASG instances
         id: instances
         shell: bash
@@ -39,6 +58,7 @@ jobs:
           set -euo pipefail
 
           echo "Querying instances from ASG: $ASG_NAME"
+
           INSTANCE_IDS=$(aws autoscaling describe-auto-scaling-groups \
             --auto-scaling-group-names "$ASG_NAME" \
             --region "$AWS_REGION" \
@@ -50,15 +70,34 @@ jobs:
             exit 1
           fi
 
+          INSTANCE_COUNT=$(echo "$INSTANCE_IDS" | wc -w)
+
+          echo "InService instance count: $INSTANCE_COUNT"
           echo "Target Instances: $INSTANCE_IDS"
+
+          # Zero-downtime rolling deployment requires
+          # at least two application instances.
+          if [ "$INSTANCE_COUNT" -lt 2 ]; then
+            echo "ERROR: At least 2 InService instances are required."
+            echo "Current instances: $INSTANCE_COUNT"
+            exit 1
+          fi
+
           echo "instance_ids=$INSTANCE_IDS" >> "$GITHUB_OUTPUT"
 
+      # ============================================================
+      # 5. Deploy one instance at a time
+      # ============================================================
       - name: Deploy to EC2 instances
         shell: bash
         run: |
           set -euo pipefail
+
           INSTANCE_IDS="${{ steps.instances.outputs.instance_ids }}"
 
+          # ----------------------------------------------------------
+          # Get Target Group ARN dynamically
+          # ----------------------------------------------------------
           TARGET_GROUP_ARN=$(aws elbv2 describe-target-groups \
             --names "$TARGET_GROUP_NAME" \
             --region "$AWS_REGION" \
@@ -69,30 +108,159 @@ jobs:
             echo "ERROR: Target group '$TARGET_GROUP_NAME' not found."
             exit 1
           fi
+
           echo "Target Group ARN: $TARGET_GROUP_ARN"
 
+          # ----------------------------------------------------------
+          # Deploy sequentially
+          # ----------------------------------------------------------
           for INSTANCE_ID in $INSTANCE_IDS
           do
             echo ""
             echo "=========================================================="
-            echo "Deploying to Instance: $INSTANCE_ID"
+            echo "Starting deployment for Instance: $INSTANCE_ID"
             echo "=========================================================="
+
+            REGISTERED=false
+
+            # ========================================================
+            # STEP 1: Verify current ALB health
+            # ========================================================
+            echo ""
+            echo "Checking current ALB health for $INSTANCE_ID..."
+
+            CURRENT_HEALTH=$(aws elbv2 describe-target-health \
+              --target-group-arn "$TARGET_GROUP_ARN" \
+              --targets Id="$INSTANCE_ID" \
+              --region "$AWS_REGION" \
+              --query "TargetHealthDescriptions[0].TargetHealth.State" \
+              --output text 2>/dev/null || echo "unknown")
+
+            echo "Current ALB health: $CURRENT_HEALTH"
+
+            if [ "$CURRENT_HEALTH" != "healthy" ]; then
+              echo "ERROR: Instance $INSTANCE_ID is not currently healthy."
+              echo "Refusing to deploy to this instance."
+              exit 1
+            fi
+
+            # ========================================================
+            # STEP 2: Deregister instance from ALB
+            # ========================================================
+            echo ""
+            echo "Deregistering $INSTANCE_ID from ALB..."
+
+            aws elbv2 deregister-targets \
+              --target-group-arn "$TARGET_GROUP_ARN" \
+              --targets Id="$INSTANCE_ID" \
+              --region "$AWS_REGION"
+
+            echo "Instance $INSTANCE_ID deregistration requested."
+
+            # ========================================================
+            # STEP 3: Wait for connection draining
+            # ========================================================
+            echo ""
+            echo "Waiting for ALB connection draining..."
+
+            DRAINED=false
+
+            for drain_attempt in $(seq 1 60)
+            do
+              TARGET_STATE=$(aws elbv2 describe-target-health \
+                --target-group-arn "$TARGET_GROUP_ARN" \
+                --targets Id="$INSTANCE_ID" \
+                --region "$AWS_REGION" \
+                --query "TargetHealthDescriptions[0].TargetHealth.State" \
+                --output text 2>/dev/null || echo "unused")
+
+              echo "ALB state ($drain_attempt/60): $TARGET_STATE"
+
+              if [ "$TARGET_STATE" = "unused" ]; then
+                DRAINED=true
+                echo "Instance $INSTANCE_ID has finished draining."
+                break
+              fi
+
+              if [ "$TARGET_STATE" = "draining" ]; then
+                echo "Existing connections are still draining..."
+              fi
+
+              sleep 5
+            done
+
+            if [ "$DRAINED" != "true" ]; then
+              echo "ERROR: ALB draining timed out for $INSTANCE_ID."
+
+              echo "Attempting to register instance back into ALB..."
+
+              aws elbv2 register-targets \
+                --target-group-arn "$TARGET_GROUP_ARN" \
+                --targets Id="$INSTANCE_ID" \
+                --region "$AWS_REGION" || true
+
+              exit 1
+            fi
+
+            # ========================================================
+            # STEP 4: Deploy application through SSM
+            # ========================================================
+            echo ""
+            echo "Starting SSM deployment on $INSTANCE_ID..."
 
             COMMAND_ID=$(aws ssm send-command \
               --instance-ids "$INSTANCE_ID" \
               --document-name "AWS-RunShellScript" \
               --timeout-seconds 900 \
               --comment "Deploy Spring Boot Application" \
-              --parameters 'commands=["set -e","export HOME=/home/ssm-user","echo === PULLING LATEST CODE ===","cd /home/ssm-user/spring-boot-docker-rest-api/rest-api","git config --global --add safe.directory /home/ssm-user/spring-boot-docker-rest-api","git fetch origin master","git reset --hard origin/master","echo === BUILDING JAR WITH MAVEN ===","./mvnw clean package -DskipTests","echo === BUILD COMPLETE ===","ls -lh target/spring-boot-rest-api-v1.jar","echo === RESTARTING SPRING BOOT SERVICE ===","sudo systemctl restart springboot","echo === WAITING FOR APPLICATION HEALTH ===","for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31 32 33 34 35 36 37 38 39 40 41 42 43 44 45 46 47 48 49 50 51 52 53 54 55 56 57 58 59 60; do if curl -s -f http://localhost:9090/api/v1/categories/ > /dev/null 2>&1; then echo APPLICATION_HEALTHY; exit 0; fi; if ! sudo systemctl is-active --quiet springboot; then echo ERROR_SERVICE_STOPPED; sudo journalctl -u springboot -n 50 --no-pager; exit 1; fi; echo Waiting_for_health_attempt_$i; sleep 5; done; echo ERROR_HEALTH_TIMEOUT; sudo journalctl -u springboot -n 50 --no-pager; exit 1"]' \
+              --parameters 'commands=[
+                "set -e",
+                "export HOME=/home/ssm-user",
+                "echo === PULLING LATEST CODE ===",
+                "cd /home/ssm-user/spring-boot-docker-rest-api/rest-api",
+                "git config --global --add safe.directory /home/ssm-user/spring-boot-docker-rest-api",
+                "git fetch origin master",
+                "git reset --hard origin/master",
+                "echo === BUILDING JAR WITH MAVEN ===",
+                "./mvnw clean package -DskipTests",
+                "echo === BUILD COMPLETE ===",
+                "ls -lh target/spring-boot-rest-api-v1.jar",
+                "echo === RESTARTING SPRING BOOT SERVICE ===",
+                "sudo systemctl restart springboot",
+                "echo === WAITING FOR APPLICATION HEALTH ===",
+                "for i in $(seq 1 60); do",
+                "  if curl -s -f http://localhost:9090/api/v1/categories/ > /dev/null 2>&1; then",
+                "    echo APPLICATION_HEALTHY",
+                "    exit 0",
+                "  fi",
+                "  if ! sudo systemctl is-active --quiet springboot; then",
+                "    echo ERROR_SERVICE_STOPPED",
+                "    sudo journalctl -u springboot -n 50 --no-pager",
+                "    exit 1",
+                "  fi",
+                "  echo Waiting_for_health_attempt_$i",
+                "  sleep 5",
+                "done",
+                "echo ERROR_HEALTH_TIMEOUT",
+                "sudo journalctl -u springboot -n 50 --no-pager",
+                "exit 1"
+              ]' \
               --region "$AWS_REGION" \
               --query "Command.CommandId" \
               --output text)
 
             echo "SSM Command ID: $COMMAND_ID"
 
+            # ========================================================
+            # STEP 5: Wait for SSM deployment
+            # ========================================================
+            echo ""
             echo "Waiting for deployment to complete..."
+
             SUCCESS=false
-            for i in $(seq 1 90); do
+
+            for i in $(seq 1 90)
+            do
               STATUS=$(aws ssm get-command-invocation \
                 --command-id "$COMMAND_ID" \
                 --instance-id "$INSTANCE_ID" \
@@ -105,25 +273,70 @@ jobs:
               if [ "$STATUS" = "Success" ]; then
                 SUCCESS=true
                 break
-              elif [ "$STATUS" = "Failed" ] || [ "$STATUS" = "Cancelled" ] || [ "$STATUS" = "TimedOut" ]; then
-                echo "DEPLOYMENT FAILED on $INSTANCE_ID (Status: $STATUS)"
+              fi
+
+              if [ "$STATUS" = "Failed" ] || \
+                 [ "$STATUS" = "Cancelled" ] || \
+                 [ "$STATUS" = "TimedOut" ]; then
+
+                echo ""
+                echo "=========================================================="
+                echo "DEPLOYMENT FAILED"
+                echo "Instance: $INSTANCE_ID"
+                echo "Status: $STATUS"
+                echo "=========================================================="
+
                 aws ssm get-command-invocation \
                   --command-id "$COMMAND_ID" \
                   --instance-id "$INSTANCE_ID" \
                   --region "$AWS_REGION" \
                   --query "{Status:Status,Output:StandardOutputContent,Error:StandardErrorContent}" \
-                  --output json
+                  --output json || true
+
+                # ----------------------------------------------------
+                # IMPORTANT:
+                # Put failed instance back into ALB.
+                # ----------------------------------------------------
+                echo ""
+                echo "Re-registering failed instance with ALB..."
+
+                aws elbv2 register-targets \
+                  --target-group-arn "$TARGET_GROUP_ARN" \
+                  --targets Id="$INSTANCE_ID" \
+                  --region "$AWS_REGION" || true
+
+                REGISTERED=true
+
                 exit 1
               fi
+
               sleep 10
             done
 
+            # ========================================================
+            # STEP 6: Handle SSM timeout
+            # ========================================================
             if [ "$SUCCESS" != "true" ]; then
               echo "ERROR: SSM command timed out."
+
+              echo "Re-registering instance $INSTANCE_ID with ALB..."
+
+              aws elbv2 register-targets \
+                --target-group-arn "$TARGET_GROUP_ARN" \
+                --targets Id="$INSTANCE_ID" \
+                --region "$AWS_REGION" || true
+
+              REGISTERED=true
+
               exit 1
             fi
 
+            # ========================================================
+            # STEP 7: Show deployment output
+            # ========================================================
+            echo ""
             echo "--- Deployment Output ---"
+
             aws ssm get-command-invocation \
               --command-id "$COMMAND_ID" \
               --instance-id "$INSTANCE_ID" \
@@ -131,10 +344,31 @@ jobs:
               --query "StandardOutputContent" \
               --output text
 
+            # ========================================================
+            # STEP 8: Register instance back with ALB
+            # ========================================================
+            echo ""
+            echo "Registering $INSTANCE_ID back with ALB..."
+
+            aws elbv2 register-targets \
+              --target-group-arn "$TARGET_GROUP_ARN" \
+              --targets Id="$INSTANCE_ID" \
+              --region "$AWS_REGION"
+
+            REGISTERED=true
+
+            echo "Instance $INSTANCE_ID registered with ALB."
+
+            # ========================================================
+            # STEP 9: Wait for ALB health check
+            # ========================================================
             echo ""
             echo "Waiting for ALB health check..."
+
             ALB_HEALTHY=false
-            for alb_attempt in $(seq 1 30); do
+
+            for alb_attempt in $(seq 1 30)
+            do
               HEALTH=$(aws elbv2 describe-target-health \
                 --target-group-arn "$TARGET_GROUP_ARN" \
                 --targets Id="$INSTANCE_ID" \
@@ -143,28 +377,58 @@ jobs:
                 --output text 2>/dev/null || echo "unknown")
 
               echo "ALB Health ($alb_attempt/30): $HEALTH"
+
               if [ "$HEALTH" = "healthy" ]; then
                 ALB_HEALTHY=true
                 break
               fi
+
               sleep 10
             done
 
+            # ========================================================
+            # STEP 10: If ALB health check fails
+            # ========================================================
             if [ "$ALB_HEALTHY" != "true" ]; then
-              echo "ERROR: ALB health check failed for $INSTANCE_ID"
+
+              echo ""
+              echo "=========================================================="
+              echo "ERROR: ALB health check failed"
+              echo "Instance: $INSTANCE_ID"
+              echo "=========================================================="
+
               aws elbv2 describe-target-health \
                 --target-group-arn "$TARGET_GROUP_ARN" \
                 --targets Id="$INSTANCE_ID" \
                 --region "$AWS_REGION" \
-                --output json
+                --output json || true
+
+              echo ""
+              echo "Instance remains registered so ALB can continue"
+              echo "monitoring its health."
+
               exit 1
             fi
 
+            # ========================================================
+            # STEP 11: Instance successfully deployed
+            # ========================================================
+            echo ""
+            echo "=========================================================="
             echo "Instance $INSTANCE_ID: HEALTHY"
+            echo "Deployment successful."
+            echo "=========================================================="
+
+            # Small delay before moving to the next instance
             sleep 5
+
           done
 
+          # ==========================================================
+          # ALL INSTANCES COMPLETED
+          # ==========================================================
           echo ""
           echo "=========================================================="
           echo "DEPLOYMENT COMPLETED SUCCESSFULLY"
+          echo "All instances are healthy behind the ALB."
           echo "=========================================================="
