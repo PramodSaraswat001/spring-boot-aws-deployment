@@ -318,6 +318,7 @@ jobs:
               --timeout-seconds 30 \
               --comment "Get current deployed commit SHA" \
               --parameters 'commands=[
+                "git config --global --add safe.directory /home/ssm-user/spring-boot-docker-rest-api",
                 "cd /home/ssm-user/spring-boot-docker-rest-api && git rev-parse HEAD"
               ]' \
               --region "$AWS_REGION" \
@@ -326,6 +327,7 @@ jobs:
 
             # Wait for snapshot command to complete
             SNAPSHOT_READY=false
+            sleep 3
             for snap_i in $(seq 1 12); do
               SNAP_STATUS=$(aws ssm get-command-invocation \
                 --command-id "$SNAPSHOT_CMD_ID" \
