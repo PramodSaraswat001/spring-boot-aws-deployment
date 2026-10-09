@@ -11,11 +11,17 @@ permissions:
   id-token: write
   contents: read
 
+# Prevent overlapping rolling deployments
+concurrency:
+  group: production-deploy
+  cancel-in-progress: false  # Don't cancel running deploy; queue the new one
+
 # Common deployment configuration
 env:
   AWS_REGION: ap-south-1
   ASG_NAME: springboot-app-asg
   TARGET_GROUP_NAME: springboot-tg
+  DEPLOY_SHA: ${{ github.sha }}
 
 jobs:
   deploy:
@@ -47,6 +53,8 @@ jobs:
 
           echo "AWS Identity:"
           aws sts get-caller-identity
+          echo ""
+          echo "Deploy SHA: $DEPLOY_SHA"
 
       # ============================================================
       # 4. Get InService instances from Auto Scaling Group
@@ -86,7 +94,7 @@ jobs:
           echo "instance_ids=$INSTANCE_IDS" >> "$GITHUB_OUTPUT"
 
       # ============================================================
-      # 5. Deploy one instance at a time
+      # 5. Deploy one instance at a time (with rollback support)
       # ============================================================
       - name: Deploy to EC2 instances
         shell: bash
@@ -112,6 +120,134 @@ jobs:
           echo "Target Group ARN: $TARGET_GROUP_ARN"
 
           # ----------------------------------------------------------
+          # Rollback function: reverts an instance to a previous SHA
+          # ----------------------------------------------------------
+          rollback_instance() {
+            local INST_ID="$1"
+            local PREV_SHA="$2"
+
+            echo ""
+            echo "=========================================================="
+            echo "ROLLING BACK Instance: $INST_ID to SHA: $PREV_SHA"
+            echo "=========================================================="
+
+            local RB_CMD_ID
+            RB_CMD_ID=$(aws ssm send-command \
+              --instance-ids "$INST_ID" \
+              --document-name "AWS-RunShellScript" \
+              --timeout-seconds 900 \
+              --comment "Rollback Spring Boot Application to $PREV_SHA" \
+              --parameters "commands=[
+                \"set -e\",
+                \"export HOME=/home/ssm-user\",
+                \"echo === ROLLING BACK TO $PREV_SHA ===\",
+                \"cd /home/ssm-user/spring-boot-docker-rest-api/rest-api\",
+                \"git config --global --add safe.directory /home/ssm-user/spring-boot-docker-rest-api\",
+                \"git fetch origin\",
+                \"git checkout $PREV_SHA\",
+                \"echo === BUILDING PREVIOUS VERSION ===\",
+                \"./mvnw clean package -DskipTests\",
+                \"echo === RESTARTING SERVICE ===\",
+                \"sudo systemctl restart springboot\",
+                \"echo === WAITING FOR HEALTH ===\",
+                \"for i in \$(seq 1 60); do\",
+                \"  if curl -s -f http://localhost:9090/api/v1/categories/ > /dev/null 2>&1; then\",
+                \"    echo ROLLBACK_HEALTHY\",
+                \"    exit 0\",
+                \"  fi\",
+                \"  echo Waiting_for_rollback_health_attempt_\$i\",
+                \"  sleep 5\",
+                \"done\",
+                \"echo ROLLBACK_HEALTH_TIMEOUT\",
+                \"exit 1\"
+              ]" \
+              --region "$AWS_REGION" \
+              --query "Command.CommandId" \
+              --output text)
+
+            echo "Rollback SSM Command ID: $RB_CMD_ID"
+
+            # Wait for rollback to complete
+            for rb_i in $(seq 1 90); do
+              local RB_STATUS
+              RB_STATUS=$(aws ssm get-command-invocation \
+                --command-id "$RB_CMD_ID" \
+                --instance-id "$INST_ID" \
+                --region "$AWS_REGION" \
+                --query "Status" \
+                --output text 2>/dev/null || echo "Pending")
+
+              echo "Rollback SSM Status ($rb_i/90): $RB_STATUS"
+
+              if [ "$RB_STATUS" = "Success" ]; then
+                echo "Rollback SUCCEEDED for $INST_ID"
+                return 0
+              fi
+
+              if [ "$RB_STATUS" = "Failed" ] || \
+                 [ "$RB_STATUS" = "Cancelled" ] || \
+                 [ "$RB_STATUS" = "TimedOut" ]; then
+                echo "ERROR: Rollback FAILED for $INST_ID (Status: $RB_STATUS)"
+                return 1
+              fi
+
+              sleep 10
+            done
+
+            echo "ERROR: Rollback timed out for $INST_ID"
+            return 1
+          }
+
+          # ----------------------------------------------------------
+          # Track deployed instances for full-fleet rollback
+          # Format: "INSTANCE_ID:PREVIOUS_SHA"
+          # ----------------------------------------------------------
+          DEPLOYED_INSTANCES=()
+
+          # ----------------------------------------------------------
+          # Full-fleet rollback: reverts all previously deployed
+          # instances on failure
+          # ----------------------------------------------------------
+          rollback_all_deployed() {
+            if [ ${#DEPLOYED_INSTANCES[@]} -eq 0 ]; then
+              echo "No previously deployed instances to roll back."
+              return
+            fi
+
+            echo ""
+            echo "=========================================================="
+            echo "INITIATING FULL-FLEET ROLLBACK"
+            echo "Rolling back ${#DEPLOYED_INSTANCES[@]} previously deployed instance(s)..."
+            echo "=========================================================="
+
+            local ROLLBACK_FAILURES=0
+
+            for ENTRY in "${DEPLOYED_INSTANCES[@]}"; do
+              local INST_ID="${ENTRY%%:*}"
+              local PREV_SHA="${ENTRY##*:}"
+
+              if rollback_instance "$INST_ID" "$PREV_SHA"; then
+                echo "Re-registering rolled-back instance $INST_ID with ALB..."
+                aws elbv2 register-targets \
+                  --target-group-arn "$TARGET_GROUP_ARN" \
+                  --targets Id="$INST_ID" \
+                  --region "$AWS_REGION" || true
+              else
+                echo "WARNING: Rollback failed for $INST_ID — MANUAL INTERVENTION REQUIRED"
+                ROLLBACK_FAILURES=$((ROLLBACK_FAILURES + 1))
+              fi
+            done
+
+            if [ "$ROLLBACK_FAILURES" -gt 0 ]; then
+              echo ""
+              echo "=========================================================="
+              echo "WARNING: $ROLLBACK_FAILURES instance(s) failed to roll back."
+              echo "MANUAL INTERVENTION REQUIRED"
+              echo "=========================================================="
+            fi
+          }
+
+          # ----------------------------------------------------------
           # Deploy sequentially
           # ----------------------------------------------------------
           for INSTANCE_ID in $INSTANCE_IDS
@@ -124,7 +260,32 @@ jobs:
             REGISTERED=false
 
             # ========================================================
-            # STEP 1: Verify current ALB health
+            # STEP 1: Fleet health gate — ensure enough healthy
+            # targets remain before draining this instance
+            # ========================================================
+            echo ""
+            echo "Checking fleet health before draining $INSTANCE_ID..."
+
+            HEALTHY_COUNT=$(aws elbv2 describe-target-health \
+              --target-group-arn "$TARGET_GROUP_ARN" \
+              --region "$AWS_REGION" \
+              --query "length(TargetHealthDescriptions[?TargetHealth.State=='healthy'])" \
+              --output text)
+
+            echo "Current healthy target count: $HEALTHY_COUNT"
+
+            # At least 2 healthy targets required (1 will remain
+            # serving traffic while we drain this one)
+            if [ "$HEALTHY_COUNT" -lt 2 ]; then
+              echo "ERROR: Only $HEALTHY_COUNT healthy targets."
+              echo "Need at least 2 healthy targets to safely drain one."
+              echo "Aborting deployment."
+              rollback_all_deployed
+              exit 1
+            fi
+
+            # ========================================================
+            # STEP 2: Verify current ALB health for this instance
             # ========================================================
             echo ""
             echo "Checking current ALB health for $INSTANCE_ID..."
@@ -141,11 +302,70 @@ jobs:
             if [ "$CURRENT_HEALTH" != "healthy" ]; then
               echo "ERROR: Instance $INSTANCE_ID is not currently healthy."
               echo "Refusing to deploy to this instance."
+              rollback_all_deployed
               exit 1
             fi
 
             # ========================================================
-            # STEP 2: Deregister instance from ALB
+            # STEP 3: Snapshot current commit for rollback
+            # ========================================================
+            echo ""
+            echo "Capturing current commit SHA on $INSTANCE_ID for rollback..."
+
+            SNAPSHOT_CMD_ID=$(aws ssm send-command \
+              --instance-ids "$INSTANCE_ID" \
+              --document-name "AWS-RunShellScript" \
+              --timeout-seconds 30 \
+              --comment "Get current deployed commit SHA" \
+              --parameters 'commands=[
+                "cd /home/ssm-user/spring-boot-docker-rest-api && git rev-parse HEAD"
+              ]' \
+              --region "$AWS_REGION" \
+              --query "Command.CommandId" \
+              --output text)
+
+            # Wait for snapshot command to complete
+            SNAPSHOT_READY=false
+            for snap_i in $(seq 1 12); do
+              SNAP_STATUS=$(aws ssm get-command-invocation \
+                --command-id "$SNAPSHOT_CMD_ID" \
+                --instance-id "$INSTANCE_ID" \
+                --region "$AWS_REGION" \
+                --query "Status" \
+                --output text 2>/dev/null || echo "Pending")
+
+              if [ "$SNAP_STATUS" = "Success" ]; then
+                SNAPSHOT_READY=true
+                break
+              fi
+
+              if [ "$SNAP_STATUS" = "Failed" ] || \
+                 [ "$SNAP_STATUS" = "Cancelled" ] || \
+                 [ "$SNAP_STATUS" = "TimedOut" ]; then
+                echo "WARNING: Could not capture current SHA (Status: $SNAP_STATUS)."
+                break
+              fi
+
+              sleep 5
+            done
+
+            if [ "$SNAPSHOT_READY" = "true" ]; then
+              PREVIOUS_SHA=$(aws ssm get-command-invocation \
+                --command-id "$SNAPSHOT_CMD_ID" \
+                --instance-id "$INSTANCE_ID" \
+                --region "$AWS_REGION" \
+                --query "StandardOutputContent" \
+                --output text | tr -d '[:space:]')
+
+              echo "Previous SHA on $INSTANCE_ID: $PREVIOUS_SHA"
+            else
+              echo "ERROR: Failed to capture rollback SHA. Cannot proceed safely."
+              rollback_all_deployed
+              exit 1
+            fi
+
+            # ========================================================
+            # STEP 4: Deregister instance from ALB
             # ========================================================
             echo ""
             echo "Deregistering $INSTANCE_ID from ALB..."
@@ -158,7 +378,7 @@ jobs:
             echo "Instance $INSTANCE_ID deregistration requested."
 
             # ========================================================
-            # STEP 3: Wait for connection draining
+            # STEP 5: Wait for connection draining
             # ========================================================
             echo ""
             echo "Waiting for ALB connection draining..."
@@ -199,52 +419,54 @@ jobs:
                 --targets Id="$INSTANCE_ID" \
                 --region "$AWS_REGION" || true
 
+              rollback_all_deployed
               exit 1
             fi
 
             # ========================================================
-            # STEP 4: Deploy application through SSM
+            # STEP 6: Deploy application through SSM (pinned SHA)
             # ========================================================
             echo ""
             echo "Starting SSM deployment on $INSTANCE_ID..."
+            echo "Deploying commit: $DEPLOY_SHA"
 
             COMMAND_ID=$(aws ssm send-command \
               --instance-ids "$INSTANCE_ID" \
               --document-name "AWS-RunShellScript" \
               --timeout-seconds 900 \
-              --comment "Deploy Spring Boot Application" \
-              --parameters 'commands=[
-                "set -e",
-                "export HOME=/home/ssm-user",
-                "echo === PULLING LATEST CODE ===",
-                "cd /home/ssm-user/spring-boot-docker-rest-api/rest-api",
-                "git config --global --add safe.directory /home/ssm-user/spring-boot-docker-rest-api",
-                "git fetch origin master",
-                "git reset --hard origin/master",
-                "echo === BUILDING JAR WITH MAVEN ===",
-                "./mvnw clean package -DskipTests",
-                "echo === BUILD COMPLETE ===",
-                "ls -lh target/spring-boot-rest-api-v1.jar",
-                "echo === RESTARTING SPRING BOOT SERVICE ===",
-                "sudo systemctl restart springboot",
-                "echo === WAITING FOR APPLICATION HEALTH ===",
-                "for i in $(seq 1 60); do",
-                "  if curl -s -f http://localhost:9090/api/v1/categories/ > /dev/null 2>&1; then",
-                "    echo APPLICATION_HEALTHY",
-                "    exit 0",
-                "  fi",
-                "  if ! sudo systemctl is-active --quiet springboot; then",
-                "    echo ERROR_SERVICE_STOPPED",
-                "    sudo journalctl -u springboot -n 50 --no-pager",
-                "    exit 1",
-                "  fi",
-                "  echo Waiting_for_health_attempt_$i",
-                "  sleep 5",
-                "done",
-                "echo ERROR_HEALTH_TIMEOUT",
-                "sudo journalctl -u springboot -n 50 --no-pager",
-                "exit 1"
-              ]' \
+              --comment "Deploy Spring Boot Application - SHA: $DEPLOY_SHA" \
+              --parameters "commands=[
+                \"set -e\",
+                \"export HOME=/home/ssm-user\",
+                \"echo === DEPLOYING COMMIT: $DEPLOY_SHA ===\",
+                \"cd /home/ssm-user/spring-boot-docker-rest-api/rest-api\",
+                \"git config --global --add safe.directory /home/ssm-user/spring-boot-docker-rest-api\",
+                \"git fetch origin\",
+                \"git checkout $DEPLOY_SHA\",
+                \"echo === BUILDING JAR WITH MAVEN ===\",
+                \"./mvnw clean package -DskipTests\",
+                \"echo === BUILD COMPLETE ===\",
+                \"ls -lh target/spring-boot-rest-api-v1.jar\",
+                \"echo === RESTARTING SPRING BOOT SERVICE ===\",
+                \"sudo systemctl restart springboot\",
+                \"echo === WAITING FOR APPLICATION HEALTH ===\",
+                \"for i in \$(seq 1 60); do\",
+                \"  if curl -s -f http://localhost:9090/api/v1/categories/ > /dev/null 2>&1; then\",
+                \"    echo APPLICATION_HEALTHY\",
+                \"    exit 0\",
+                \"  fi\",
+                \"  if ! sudo systemctl is-active --quiet springboot; then\",
+                \"    echo ERROR_SERVICE_STOPPED\",
+                \"    sudo journalctl -u springboot -n 50 --no-pager\",
+                \"    exit 1\",
+                \"  fi\",
+                \"  echo Waiting_for_health_attempt_\$i\",
+                \"  sleep 5\",
+                \"done\",
+                \"echo ERROR_HEALTH_TIMEOUT\",
+                \"sudo journalctl -u springboot -n 50 --no-pager\",
+                \"exit 1\"
+              ]" \
               --region "$AWS_REGION" \
               --query "Command.CommandId" \
               --output text)
@@ -252,7 +474,7 @@ jobs:
             echo "SSM Command ID: $COMMAND_ID"
 
             # ========================================================
-            # STEP 5: Wait for SSM deployment
+            # STEP 7: Wait for SSM deployment
             # ========================================================
             echo ""
             echo "Waiting for deployment to complete..."
@@ -294,19 +516,26 @@ jobs:
                   --output json || true
 
                 # ----------------------------------------------------
-                # IMPORTANT:
-                # Put failed instance back into ALB.
+                # ROLLBACK: Revert this instance to previous version
+                # before re-registering into ALB
                 # ----------------------------------------------------
                 echo ""
-                echo "Re-registering failed instance with ALB..."
+                echo "Attempting rollback before re-registering..."
 
-                aws elbv2 register-targets \
-                  --target-group-arn "$TARGET_GROUP_ARN" \
-                  --targets Id="$INSTANCE_ID" \
-                  --region "$AWS_REGION" || true
+                if rollback_instance "$INSTANCE_ID" "$PREVIOUS_SHA"; then
+                  echo "Rollback succeeded. Re-registering $INSTANCE_ID with ALB..."
+                  aws elbv2 register-targets \
+                    --target-group-arn "$TARGET_GROUP_ARN" \
+                    --targets Id="$INSTANCE_ID" \
+                    --region "$AWS_REGION" || true
+                  REGISTERED=true
+                else
+                  echo "WARNING: Rollback FAILED for $INSTANCE_ID."
+                  echo "Instance will NOT be re-registered — MANUAL INTERVENTION REQUIRED."
+                fi
 
-                REGISTERED=true
-
+                # Roll back all previously deployed instances
+                rollback_all_deployed
                 exit 1
               fi
 
@@ -314,25 +543,31 @@ jobs:
             done
 
             # ========================================================
-            # STEP 6: Handle SSM timeout
+            # STEP 8: Handle SSM timeout
             # ========================================================
             if [ "$SUCCESS" != "true" ]; then
               echo "ERROR: SSM command timed out."
 
-              echo "Re-registering instance $INSTANCE_ID with ALB..."
+              echo "Attempting rollback before re-registering..."
 
-              aws elbv2 register-targets \
-                --target-group-arn "$TARGET_GROUP_ARN" \
-                --targets Id="$INSTANCE_ID" \
-                --region "$AWS_REGION" || true
+              if rollback_instance "$INSTANCE_ID" "$PREVIOUS_SHA"; then
+                echo "Rollback succeeded. Re-registering $INSTANCE_ID with ALB..."
+                aws elbv2 register-targets \
+                  --target-group-arn "$TARGET_GROUP_ARN" \
+                  --targets Id="$INSTANCE_ID" \
+                  --region "$AWS_REGION" || true
+                REGISTERED=true
+              else
+                echo "WARNING: Rollback FAILED for $INSTANCE_ID."
+                echo "Instance will NOT be re-registered — MANUAL INTERVENTION REQUIRED."
+              fi
 
-              REGISTERED=true
-
+              rollback_all_deployed
               exit 1
             fi
 
             # ========================================================
-            # STEP 7: Show deployment output
+            # STEP 9: Show deployment output
             # ========================================================
             echo ""
             echo "--- Deployment Output ---"
@@ -345,7 +580,7 @@ jobs:
               --output text
 
             # ========================================================
-            # STEP 8: Register instance back with ALB
+            # STEP 10: Register instance back with ALB
             # ========================================================
             echo ""
             echo "Registering $INSTANCE_ID back with ALB..."
@@ -360,7 +595,7 @@ jobs:
             echo "Instance $INSTANCE_ID registered with ALB."
 
             # ========================================================
-            # STEP 9: Wait for ALB health check
+            # STEP 11: Wait for ALB health check
             # ========================================================
             echo ""
             echo "Waiting for ALB health check..."
@@ -387,7 +622,7 @@ jobs:
             done
 
             # ========================================================
-            # STEP 10: If ALB health check fails
+            # STEP 12: If ALB health check fails — rollback
             # ========================================================
             if [ "$ALB_HEALTHY" != "true" ]; then
 
@@ -404,20 +639,73 @@ jobs:
                 --output json || true
 
               echo ""
-              echo "Instance remains registered so ALB can continue"
-              echo "monitoring its health."
+              echo "Attempting rollback of $INSTANCE_ID..."
 
+              # Deregister the unhealthy new version first
+              aws elbv2 deregister-targets \
+                --target-group-arn "$TARGET_GROUP_ARN" \
+                --targets Id="$INSTANCE_ID" \
+                --region "$AWS_REGION" || true
+
+              if rollback_instance "$INSTANCE_ID" "$PREVIOUS_SHA"; then
+                echo "Rollback succeeded. Re-registering $INSTANCE_ID with ALB..."
+                aws elbv2 register-targets \
+                  --target-group-arn "$TARGET_GROUP_ARN" \
+                  --targets Id="$INSTANCE_ID" \
+                  --region "$AWS_REGION" || true
+              else
+                echo "WARNING: Rollback FAILED — MANUAL INTERVENTION REQUIRED."
+              fi
+
+              rollback_all_deployed
               exit 1
             fi
 
             # ========================================================
-            # STEP 11: Instance successfully deployed
+            # STEP 13: Post-deploy fleet health gate
+            # ========================================================
+            echo ""
+            echo "Verifying full fleet health after deploying $INSTANCE_ID..."
+
+            POST_HEALTHY=$(aws elbv2 describe-target-health \
+              --target-group-arn "$TARGET_GROUP_ARN" \
+              --region "$AWS_REGION" \
+              --query "length(TargetHealthDescriptions[?TargetHealth.State=='healthy'])" \
+              --output text)
+
+            TOTAL_TARGETS=$(aws elbv2 describe-target-health \
+              --target-group-arn "$TARGET_GROUP_ARN" \
+              --region "$AWS_REGION" \
+              --query "length(TargetHealthDescriptions)" \
+              --output text)
+
+            echo "Fleet health: $POST_HEALTHY/$TOTAL_TARGETS healthy"
+
+            if [ "$POST_HEALTHY" -lt "$TOTAL_TARGETS" ]; then
+              echo "WARNING: Not all targets are healthy after deploying $INSTANCE_ID."
+              echo "Aborting remaining deployments and rolling back..."
+
+              # This instance is already healthy, but add it to
+              # rollback tracking before triggering fleet rollback
+              DEPLOYED_INSTANCES+=("$INSTANCE_ID:$PREVIOUS_SHA")
+
+              rollback_all_deployed
+              exit 1
+            fi
+
+            # ========================================================
+            # STEP 14: Instance successfully deployed
             # ========================================================
             echo ""
             echo "=========================================================="
             echo "Instance $INSTANCE_ID: HEALTHY"
+            echo "Deployed commit: $DEPLOY_SHA"
+            echo "Previous commit: $PREVIOUS_SHA"
             echo "Deployment successful."
             echo "=========================================================="
+
+            # Track this instance for potential fleet rollback
+            DEPLOYED_INSTANCES+=("$INSTANCE_ID:$PREVIOUS_SHA")
 
             # Small delay before moving to the next instance
             sleep 5
@@ -430,5 +718,23 @@ jobs:
           echo ""
           echo "=========================================================="
           echo "DEPLOYMENT COMPLETED SUCCESSFULLY"
+          echo "Commit: $DEPLOY_SHA"
           echo "All instances are healthy behind the ALB."
           echo "=========================================================="
+
+          echo "::notice title=Deployment Complete::SHA=$DEPLOY_SHA deployed to $(echo $INSTANCE_IDS | wc -w) instance(s)"
+
+      # ============================================================
+      # 6. Notify on deployment failure
+      # ============================================================
+      - name: Notify on failure
+        if: failure()
+        run: |
+          echo "::error title=Deployment Failed::Rolling deployment failed for commit $DEPLOY_SHA"
+
+          # Uncomment and configure to enable SNS notifications:
+          # aws sns publish \
+          #   --topic-arn "${{ vars.SNS_ALERT_TOPIC }}" \
+          #   --subject "🚨 Deployment Failed" \
+          #   --message "Rolling deployment failed for commit $DEPLOY_SHA. Check: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
+          #   --region "$AWS_REGION"
