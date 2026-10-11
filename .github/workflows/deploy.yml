@@ -318,6 +318,8 @@ jobs:
               --timeout-seconds 30 \
               --comment "Get current deployed commit SHA" \
               --parameters 'commands=[
+                "set -e",
+                "export HOME=/home/ssm-user",
                 "git config --global --add safe.directory /home/ssm-user/spring-boot-docker-rest-api",
                 "cd /home/ssm-user/spring-boot-docker-rest-api && git rev-parse HEAD"
               ]' \
