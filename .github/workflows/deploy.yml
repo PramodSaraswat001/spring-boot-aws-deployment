@@ -94,7 +94,24 @@ jobs:
           echo "instance_ids=$INSTANCE_IDS" >> "$GITHUB_OUTPUT"
 
       # ============================================================
-      # 5. Deploy one instance at a time (with rollback support)
+      # 5. Suspend ASG processes during deployment
+      # ============================================================
+      - name: Suspend ASG scaling processes
+        run: |
+          set -euo pipefail
+
+          echo "Suspending ASG processes to prevent interference during rolling deploy..."
+
+          aws autoscaling suspend-processes \
+            --auto-scaling-group-name "$ASG_NAME" \
+            --scaling-processes HealthCheck ReplaceUnhealthy Launch Terminate AZRebalance \
+            --region "$AWS_REGION"
+
+          echo "Suspended processes: HealthCheck, ReplaceUnhealthy, Launch, Terminate, AZRebalance"
+          echo "ASG will not terminate/replace instances while they are deregistered from ALB."
+
+      # ============================================================
+      # 6. Deploy one instance at a time (with rollback support)
       # ============================================================
       - name: Deploy to EC2 instances
         shell: bash
@@ -729,7 +746,39 @@ jobs:
           echo "::notice title=Deployment Complete::SHA=$DEPLOY_SHA deployed to $(echo $INSTANCE_IDS | wc -w) instance(s)"
 
       # ============================================================
-      # 6. Notify on deployment failure
+      # 7. Resume ASG processes after successful deployment
+      # ============================================================
+      - name: Resume ASG scaling processes
+        if: success()
+        run: |
+          set -euo pipefail
+
+          echo "Resuming ASG processes after successful deployment..."
+
+          aws autoscaling resume-processes \
+            --auto-scaling-group-name "$ASG_NAME" \
+            --scaling-processes HealthCheck ReplaceUnhealthy Launch Terminate AZRebalance \
+            --region "$AWS_REGION"
+
+          echo "ASG processes resumed. Auto Scaling is back to normal."
+
+      # ============================================================
+      # 8. Always resume ASG processes (even on failure)
+      # ============================================================
+      - name: Resume ASG processes (cleanup)
+        if: always()
+        run: |
+          echo "Ensuring ASG processes are resumed (safety net)..."
+
+          aws autoscaling resume-processes \
+            --auto-scaling-group-name "$ASG_NAME" \
+            --scaling-processes HealthCheck ReplaceUnhealthy Launch Terminate AZRebalance \
+            --region "$AWS_REGION" || true
+
+          echo "ASG processes resumed."
+
+      # ============================================================
+      # 9. Notify on deployment failure
       # ============================================================
       - name: Notify on failure
         if: failure()
