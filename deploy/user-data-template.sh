@@ -1,14 +1,22 @@
 #!/bin/bash
 set -e
 
-# Ensure standard binary paths are available to root
-export PATH=$PATH:/usr/local/bin:/usr/bin:/bin
+# Ensure standard binary and snap paths are available to root
+export PATH=$PATH:/snap/bin:/usr/local/bin:/usr/bin:/bin
 
 # Logging for debugging (viewable at /var/log/user-data.log)
 exec > >(tee /var/log/user-data.log|logger -t user-data -s 2>/dev/console) 2>&1
 echo "=== Starting S3 Artifact Boot Script ==="
 
-# Variables injected during deployment
+# 1. Ensure AWS CLI is installed (Ubuntu 24.04 uses snap)
+if ! command -v aws &> /dev/null; then
+  echo "AWS CLI not found. Installing via snap..."
+  snap install aws-cli --classic
+fi
+echo "Using AWS CLI version:"
+aws --version
+
+# 2. Variables injected during deployment
 S3_JAR_PATH="__S3_JAR_PATH__"
 DEPLOY_SHA="__DEPLOY_SHA__"
 APP_DIR="/home/ssm-user/spring-boot-docker-rest-api/rest-api/target"
@@ -23,7 +31,7 @@ mkdir -p "${APP_DIR}"
 # Stop old service if running (releases file lock and frees RAM on t3.micro)
 systemctl stop springboot || true
 
-# Download the pre-built JAR from private S3 bucket with retry (up to 5 attempts)
+# 3. Download the pre-built JAR from private S3 bucket with retry (up to 5 attempts)
 DOWNLOAD_SUCCESS=false
 for i in {1..5}; do
   if aws s3 cp "${S3_JAR_PATH}" "${APP_DIR}/${JAR_NAME}" --region ap-south-1; then
@@ -40,16 +48,16 @@ if [ "$DOWNLOAD_SUCCESS" != "true" ]; then
   exit 1
 fi
 
-# Ensure proper permissions
+# 4. Ensure proper permissions
 chown -R ssm-user:ssm-user "${APP_DIR}"
 chmod 755 "${APP_DIR}/${JAR_NAME}"
 
-# Reload systemd and start the springboot service
+# 5. Reload systemd and start the springboot service
 echo "Starting springboot service..."
 systemctl daemon-reload
 systemctl restart springboot
 
-# Wait for Spring Boot application to become locally healthy (up to 60s)
+# 6. Wait for Spring Boot application to become locally healthy (up to 60s)
 echo "Waiting for Spring Boot to start on port 9090..."
 APP_HEALTHY=false
 for attempt in {1..20}; do
