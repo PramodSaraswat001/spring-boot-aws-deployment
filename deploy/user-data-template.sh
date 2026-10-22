@@ -8,6 +8,14 @@ export PATH=$PATH:/snap/bin:/usr/local/bin:/usr/bin:/bin
 exec > >(tee /var/log/user-data.log|logger -t user-data -s 2>/dev/console) 2>&1
 echo "=== Starting S3 Artifact Boot Script ==="
 
+# 0. Immediately kill the stale auto-started service from the AMI
+#    The AMI has springboot.service enabled, so systemd auto-starts it on boot
+#    BEFORE user-data runs. This old/stale JAR wastes RAM and holds file locks.
+echo "Stopping stale springboot service (if auto-started by AMI)..."
+systemctl stop springboot 2>/dev/null || true
+systemctl disable springboot 2>/dev/null || true
+echo "Stale service stopped and disabled."
+
 # 1. Ensure AWS CLI is installed (Ubuntu 24.04 uses snap)
 if ! command -v aws &> /dev/null; then
   echo "AWS CLI not found. Installing via snap..."
@@ -28,8 +36,7 @@ echo "Downloading JAR from: ${S3_JAR_PATH}"
 # Ensure destination directory exists
 mkdir -p "${APP_DIR}"
 
-# Stop old service if running (releases file lock and frees RAM on t3.micro)
-systemctl stop springboot || true
+# (Service already stopped in step 0 above)
 
 # 3. Download the pre-built JAR from private S3 bucket with retry (up to 5 attempts)
 DOWNLOAD_SUCCESS=false
@@ -52,9 +59,30 @@ fi
 chown -R ssm-user:ssm-user "${APP_DIR}"
 chmod 755 "${APP_DIR}/${JAR_NAME}"
 
-# 5. Reload systemd and start the springboot service
-echo "Starting springboot service..."
+# 4.5. Apply JVM memory limits via systemd drop-in override
+#      t3.micro has only 1 GB RAM. Without limits, the JVM can consume all
+#      available memory and get killed by the Linux OOM killer, which causes
+#      the springboot service to crash, ALB health check to fail, and ASG
+#      to terminate the instance in a loop.
+#
+#      Memory budget on t3.micro (1024 MB):
+#        OS + system services  : ~300 MB
+#        JVM heap (-Xmx512m)   : ~512 MB
+#        JVM metaspace/threads : ~150 MB
+#        Buffer                : ~62 MB
+echo "Applying JVM memory limits for t3.micro..."
+mkdir -p /etc/systemd/system/springboot.service.d
+cat > /etc/systemd/system/springboot.service.d/memory-limits.conf << 'OVERRIDE'
+[Service]
+ExecStart=
+ExecStart=/usr/bin/java -Xms128m -Xmx512m -XX:MaxMetaspaceSize=128m -jar /home/ssm-user/spring-boot-docker-rest-api/rest-api/target/spring-boot-rest-api-v1.jar
+OVERRIDE
+echo "JVM memory limits applied: -Xms128m -Xmx512m -XX:MaxMetaspaceSize=128m"
+
+# 5. Re-enable, reload, and start the springboot service
+echo "Re-enabling and starting springboot service..."
 systemctl daemon-reload
+systemctl enable springboot
 systemctl restart springboot
 
 # 6. Wait for Spring Boot application to become locally healthy (up to 180s)
