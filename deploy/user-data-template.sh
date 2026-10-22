@@ -57,21 +57,21 @@ echo "Starting springboot service..."
 systemctl daemon-reload
 systemctl restart springboot
 
-# 6. Wait for Spring Boot application to become locally healthy (up to 60s)
+# 6. Wait for Spring Boot application to become locally healthy (up to 180s)
 echo "Waiting for Spring Boot to start on port 9090..."
 APP_HEALTHY=false
-for attempt in {1..20}; do
+for attempt in {1..60}; do
   if curl -s -f http://localhost:9090/api/v1/categories/ > /dev/null 2>&1; then
     echo "Application is healthy and responding on port 9090!"
     APP_HEALTHY=true
     break
   fi
-  echo "Health check attempt $attempt/20. Waiting 3s..."
+  echo "Health check attempt $attempt/60. Waiting 3s..."
   sleep 3
 done
 
 if [ "$APP_HEALTHY" != "true" ]; then
-  echo "WARNING: Application did not respond within 60s. Inspecting service status:"
+  echo "WARNING: Application did not respond within 180s. Inspecting service status:"
   systemctl status springboot --no-pager || true
   journalctl -u springboot -n 50 --no-pager || true
   exit 1
