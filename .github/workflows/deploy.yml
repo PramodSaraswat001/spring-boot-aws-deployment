@@ -6,12 +6,12 @@ on:
       - master
 
 permissions:
-  id-token: write
-  contents: read
+  id-token: write # Required for OIDC to assume AWS role
+  contents: read # Required to checkout code
 
 concurrency:
   group: production-deploy
-  cancel-in-progress: false
+  cancel-in-progress: false # Never cancel an in-progress deployment
 
 env:
   AWS_REGION: ap-south-1
@@ -22,11 +22,11 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      # 1. Checkout Code
+      # ─── STEP 1: Checkout Code ───────────────────────────────────
       - name: Checkout Code
         uses: actions/checkout@v4
 
-      # 2. Setup Java 8
+      # ─── STEP 2: Setup Java 8 ───────────────────────────────────
       - name: Set up JDK 1.8
         uses: actions/setup-java@v4
         with:
@@ -34,7 +34,7 @@ jobs:
           distribution: "temurin"
           cache: maven
 
-      # 3. Build JAR with Maven
+      # ─── STEP 3: Build JAR with Maven ───────────────────────────
       - name: Build with Maven
         run: |
           cd rest-api
@@ -42,14 +42,14 @@ jobs:
           echo "Built JAR:"
           ls -lh target/*.jar
 
-      # 4. Authenticate to AWS via OIDC
+      # ─── STEP 4: Authenticate to AWS via OIDC ──────────────────
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: ${{ vars.AWS_ROLE_ARN }}
           aws-region: ${{ env.AWS_REGION }}
 
-      # 5. Upload JAR Artifact to S3
+      # ─── STEP 5: Upload JAR Artifact to S3 ─────────────────────
       - name: Upload Artifact to S3
         id: s3-upload
         run: |
@@ -62,13 +62,14 @@ jobs:
 
           echo "s3_jar_uri=${S3_URI}" >> "$GITHUB_OUTPUT"
 
-      # 6. Create New Launch Template Version with Updated User Data
+      # ─── STEP 6: Create New Launch Template Version ─────────────
       - name: Create New Launch Template Version
         id: create-lt-version
         run: |
           LT_NAME="${{ vars.LAUNCH_TEMPLATE_NAME }}"
           S3_JAR_URI="${{ steps.s3-upload.outputs.s3_jar_uri }}"
           DEPLOY_SHA="${{ github.sha }}"
+          AMI_ID="${{ vars.BASE_AMI_ID }}"
 
           # Replace placeholders in user-data template
           sed -e "s|__S3_JAR_PATH__|${S3_JAR_URI}|g" \
@@ -78,10 +79,13 @@ jobs:
           USER_DATA_B64=$(base64 -w 0 user-data-processed.sh)
 
           echo "Creating new version for Launch Template: ${LT_NAME}"
+          echo "Using Base AMI: ${AMI_ID}"
+
+          # Include ImageId so each LT version explicitly locks to the base AMI
           NEW_VERSION=$(aws ec2 create-launch-template-version \
             --launch-template-name "${LT_NAME}" \
             --source-version '$Latest' \
-            --launch-template-data "{\"UserData\":\"${USER_DATA_B64}\"}" \
+            --launch-template-data "{\"ImageId\":\"${AMI_ID}\",\"UserData\":\"${USER_DATA_B64}\"}" \
             --query 'LaunchTemplateVersion.VersionNumber' \
             --output text)
 
@@ -95,15 +99,16 @@ jobs:
           echo "Set Version ${NEW_VERSION} as Default"
           echo "version=${NEW_VERSION}" >> "$GITHUB_OUTPUT"
 
-      # 7. Trigger ASG Instance Refresh
+      # ─── STEP 7: Trigger ASG Instance Refresh ──────────────────
       - name: Trigger ASG Instance Refresh
         run: |
           ASG="${{ vars.ASG_NAME }}"
 
           echo "Starting Instance Refresh for ASG: ${ASG}..."
+          # InstanceWarmup increased to 360s to accommodate base AMI package installation
           REFRESH_ID=$(aws autoscaling start-instance-refresh \
             --auto-scaling-group-name "${ASG}" \
-            --preferences '{"MinHealthyPercentage": 50, "InstanceWarmup": 180}' \
+            --preferences '{"MinHealthyPercentage": 50, "InstanceWarmup": 360}' \
             --query 'InstanceRefreshId' \
             --output text)
 
@@ -121,10 +126,10 @@ jobs:
             echo "Current Status: ${STATUS}"
 
             if [ "$STATUS" = "Successful" ]; then
-              echo "✅ Instance Refresh Completed Successfully!"
+              echo "Instance Refresh Completed Successfully!"
               break
             elif [ "$STATUS" = "Failed" ] || [ "$STATUS" = "Cancelled" ] || [ "$STATUS" = "RollbackSuccessful" ]; then
-              echo "❌ Instance Refresh ended with status: ${STATUS}"
+              echo "Instance Refresh ended with status: ${STATUS}"
               exit 1
             fi
 
