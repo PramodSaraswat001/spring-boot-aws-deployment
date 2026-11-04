@@ -7,9 +7,9 @@ set -euo pipefail
 # Provisions a fresh Ubuntu 24.04 instance into a fully running
 # Spring Boot application node.
 #
-# Placeholders replaced at deploy time by GitHub Actions (sed):
-#   __S3_JAR_PATH__  → s3://bucket/releases/<sha>/spring-boot-rest-api-v1.jar
-#   __DEPLOY_SHA__   → git commit SHA being deployed
+# The JAR is always downloaded from a fixed S3 location.
+# GitHub Actions overwrites this JAR on every successful build.
+# No placeholders. No sed substitution needed.
 # ═══════════════════════════════════════════════════════════════════
 
 # ─── Environment ───
@@ -22,9 +22,10 @@ exec > >(tee /var/log/user-data.log | logger -t user-data -s 2>/dev/console) 2>&
 echo "=== EC2 Boot Provisioning Started ==="
 echo "Timestamp: $(date -u '+%Y-%m-%dT%H:%M:%SZ')"
 
-# ─── Variables (injected by deploy.yml via sed) ───
-S3_JAR_PATH="__S3_JAR_PATH__"
-DEPLOY_SHA="__DEPLOY_SHA__"
+# ─── Variables ───
+# Fixed S3 location. GitHub Actions overwrites this JAR on every push.
+# Replace YOUR-BUCKET-NAME-HERE with your actual S3 bucket name.
+S3_JAR_PATH="s3://springboot-deploy-artifacts-998191690420/releases/spring-boot-rest-api-v1.jar"
 
 # ─── Constants ───
 APP_USER="springboot"
@@ -32,7 +33,6 @@ APP_DIR="/opt/springboot"
 JAR_NAME="spring-boot-rest-api-v1.jar"
 AWS_REGION="ap-south-1"
 
-echo "Deploying commit: ${DEPLOY_SHA}"
 echo "JAR source: ${S3_JAR_PATH}"
 
 # ═══════════════════════════════════════════════════════════════════
@@ -134,7 +134,6 @@ DB_PORT=${DB_PORT}
 DB_NAME=${DB_NAME}
 DB_USER=${DB_USER}
 DB_PASS=${DB_PASS}
-DEPLOY_SHA=${DEPLOY_SHA}
 ENVFILE
 
 chown "${APP_USER}:${APP_USER}" "${APP_DIR}/springboot.env"

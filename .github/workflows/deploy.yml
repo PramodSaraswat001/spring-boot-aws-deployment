@@ -1,4 +1,4 @@
-name: Build, Release & Rolling Deploy
+name: Build & Deploy
 
 on:
   push:
@@ -17,16 +17,21 @@ env:
   AWS_REGION: ap-south-1
 
 jobs:
-  build-and-deploy:
-    name: Build, Release & Refresh ASG
+  # ═══════════════════════════════════════════════════════════════
+  # JOB 1: BUILD
+  # Builds the Spring Boot JAR and uploads it to a fixed S3 path.
+  # Overwrites the previous JAR on every successful build.
+  # ═══════════════════════════════════════════════════════════════
+  build:
+    name: Build & Upload JAR
     runs-on: ubuntu-latest
 
     steps:
-      # ─── STEP 1: Checkout Code ───────────────────────────────────
+      # ─── STEP 1: Checkout Code ─────────────────────────────────
       - name: Checkout Code
         uses: actions/checkout@v4
 
-      # ─── STEP 2: Setup Java 8 ───────────────────────────────────
+      # ─── STEP 2: Setup Java 8 ──────────────────────────────────
       - name: Set up JDK 1.8
         uses: actions/setup-java@v4
         with:
@@ -34,7 +39,7 @@ jobs:
           distribution: "temurin"
           cache: maven
 
-      # ─── STEP 3: Build JAR with Maven ───────────────────────────
+      # ─── STEP 3: Build JAR with Maven ──────────────────────────
       - name: Build with Maven
         run: |
           cd rest-api
@@ -49,63 +54,46 @@ jobs:
           role-to-assume: ${{ vars.AWS_ROLE_ARN }}
           aws-region: ${{ env.AWS_REGION }}
 
-      # ─── STEP 5: Upload JAR Artifact to S3 ─────────────────────
-      - name: Upload Artifact to S3
-        id: s3-upload
+      # ─── STEP 5: Upload JAR to Fixed S3 Location ───────────────
+      # The S3 key is fixed and never changes.
+      # Every push overwrites the previous JAR. No per-commit paths.
+      - name: Upload JAR to S3 (fixed path)
         run: |
           S3_BUCKET="${{ vars.S3_ARTIFACT_BUCKET }}"
-          DEPLOY_SHA="${{ github.sha }}"
-          S3_URI="s3://${S3_BUCKET}/releases/${DEPLOY_SHA}/spring-boot-rest-api-v1.jar"
+          S3_KEY="releases/spring-boot-rest-api-v1.jar"
+          S3_URI="s3://${S3_BUCKET}/${S3_KEY}"
 
-          echo "Uploading JAR to ${S3_URI}..."
+          echo "Uploading JAR to fixed location: ${S3_URI}"
           aws s3 cp rest-api/target/spring-boot-rest-api-v1.jar "${S3_URI}"
+          echo "Upload complete. Previous JAR (if any) has been overwritten."
 
-          echo "s3_jar_uri=${S3_URI}" >> "$GITHUB_OUTPUT"
+  # ═══════════════════════════════════════════════════════════════
+  # JOB 2: DEPLOY
+  # Runs only after the Build job succeeds.
+  # Triggers an ASG Instance Refresh. New EC2 instances will boot
+  # and download the latest JAR from the fixed S3 location via
+  # the Launch Template User Data script.
+  # ═══════════════════════════════════════════════════════════════
+  deploy:
+    name: Deploy — Trigger ASG Instance Refresh
+    runs-on: ubuntu-latest
+    needs: build # Only runs if the build job succeeds
 
-      # ─── STEP 6: Create New Launch Template Version ─────────────
-      - name: Create New Launch Template Version
-        id: create-lt-version
-        run: |
-          LT_NAME="${{ vars.LAUNCH_TEMPLATE_NAME }}"
-          S3_JAR_URI="${{ steps.s3-upload.outputs.s3_jar_uri }}"
-          DEPLOY_SHA="${{ github.sha }}"
-          AMI_ID="${{ vars.BASE_AMI_ID }}"
+    steps:
+      # ─── STEP 1: Authenticate to AWS via OIDC ──────────────────
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
 
-          # Replace placeholders in user-data template
-          sed -e "s|__S3_JAR_PATH__|${S3_JAR_URI}|g" \
-              -e "s|__DEPLOY_SHA__|${DEPLOY_SHA}|g" \
-              deploy/user-data-template.sh > user-data-processed.sh
-
-          USER_DATA_B64=$(base64 -w 0 user-data-processed.sh)
-
-          echo "Creating new version for Launch Template: ${LT_NAME}"
-          echo "Using Base AMI: ${AMI_ID}"
-
-          # Include ImageId so each LT version explicitly locks to the base AMI
-          NEW_VERSION=$(aws ec2 create-launch-template-version \
-            --launch-template-name "${LT_NAME}" \
-            --source-version '$Latest' \
-            --launch-template-data "{\"ImageId\":\"${AMI_ID}\",\"UserData\":\"${USER_DATA_B64}\"}" \
-            --query 'LaunchTemplateVersion.VersionNumber' \
-            --output text)
-
-          echo "Created Launch Template Version: ${NEW_VERSION}"
-
-          # Set as default version
-          aws ec2 modify-launch-template \
-            --launch-template-name "${LT_NAME}" \
-            --default-version "${NEW_VERSION}"
-
-          echo "Set Version ${NEW_VERSION} as Default"
-          echo "version=${NEW_VERSION}" >> "$GITHUB_OUTPUT"
-
-      # ─── STEP 7: Trigger ASG Instance Refresh ──────────────────
+      # ─── STEP 2: Trigger ASG Instance Refresh ──────────────────
       - name: Trigger ASG Instance Refresh
         run: |
           ASG="${{ vars.ASG_NAME }}"
 
           echo "Starting Instance Refresh for ASG: ${ASG}..."
-          # InstanceWarmup increased to 360s to accommodate base AMI package installation
+          # InstanceWarmup: 360s to accommodate base AMI package installation
           REFRESH_ID=$(aws autoscaling start-instance-refresh \
             --auto-scaling-group-name "${ASG}" \
             --preferences '{"MinHealthyPercentage": 50, "InstanceWarmup": 360}' \
@@ -114,7 +102,7 @@ jobs:
 
           echo "Instance Refresh ID: ${REFRESH_ID}"
 
-          # Wait for Instance Refresh to Complete
+          # Wait for Instance Refresh to complete
           echo "Waiting for Instance Refresh to complete..."
           while true; do
             STATUS=$(aws autoscaling describe-instance-refreshes \
